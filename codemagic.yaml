@@ -1,0 +1,46 @@
+workflows:
+  android_webview_debug:
+    name: GraFit Android WebView Debug
+    environment:
+      java: 21
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper
+    scripts:
+      - name: Build debug APK
+        script: |
+          if [ -f app/build.gradle.kts ]; then
+            PROJECT_DIR="."
+          else
+            PROJECT_DIR="android-webview-app"
+          fi
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace clean app:assembleDebug
+    artifacts:
+      - android-webview-app/app/build/outputs/**/*.apk
+      - app/build/outputs/**/*.apk
+
+  android_webview_release:
+    name: GraFit Android WebView Release
+    environment:
+      java: 21
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper
+    scripts:
+      - name: Build release APK
+        script: |
+          if [ -f app/build.gradle.kts ]; then
+            PROJECT_DIR="."
+          else
+            PROJECT_DIR="android-webview-app"
+          fi
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace clean app:assembleRelease
+    artifacts:
+      - android-webview-app/app/build/outputs/**/*.apk
+      - app/build/outputs/**/*.apk
