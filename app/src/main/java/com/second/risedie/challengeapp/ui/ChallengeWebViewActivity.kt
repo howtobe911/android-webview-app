@@ -167,11 +167,14 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        webView.removeJavascriptInterface("ChallengeAppBridge")
-        webView.stopLoading()
-        webView.webChromeClient = null
-        webView.webViewClient = null
-        webView.destroy()
-        super.onDestroy()
-    }
+    webView.removeJavascriptInterface("ChallengeAppBridge")
+
+    webView.stopLoading()
+
+    webView.webChromeClient = WebChromeClient()
+    webView.webViewClient = WebViewClient()
+
+    webView.destroy()
+    super.onDestroy()
+   }
 }
