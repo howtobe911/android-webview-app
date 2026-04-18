@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.second.risedie.challengeapp"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.second.risedie.challengeapp"
