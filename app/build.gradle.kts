@@ -64,5 +64,5 @@ dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("androidx.health.connect:connect-client:1.2.0-alpha03")
+    implementation("androidx.health.connect:connect-client:1.1.0-rc03")
 }
