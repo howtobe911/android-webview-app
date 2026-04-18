@@ -2,7 +2,7 @@ workflows:
   android_webview_debug:
     name: GraFit Android WebView Debug
     environment:
-      java: 17
+      java: 21
     scripts:
       - name: Build debug APK
         script: |
@@ -14,7 +14,7 @@ workflows:
   android_webview_release:
     name: GraFit Android WebView Release
     environment:
-      java: 17
+      java: 21
     scripts:
       - name: Build release APK
         script: |
