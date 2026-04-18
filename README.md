@@ -36,7 +36,11 @@
 - `APP_WEB_URL`
 - `APP_ALLOWED_HOSTS_JSON`
 
-## Build prerequisites
-- Use Java 21 for Gradle wrapper execution.
-- Build this project as its own repository root, or keep the dynamic Codemagic path detection in place if the full monorepo is uploaded.
-- Do not build on the production VPS; use Codemagic or a dedicated CI runner.
+
+## 2026 build baseline
+- AGP 9.0.1
+- Gradle 9.1.0
+- JDK 17
+- compileSdk / targetSdk 36
+- Health Connect client 1.1.0-rc03
+- Built-in Kotlin (do not apply org.jetbrains.kotlin.android plugin)

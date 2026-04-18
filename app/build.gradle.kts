@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 android {
@@ -10,9 +9,9 @@ android {
     defaultConfig {
         applicationId = "com.second.risedie.challengeapp"
         minSdk = 28
-        targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        targetSdk = 36
+        versionCode = 3
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -20,7 +19,11 @@ android {
         }
 
         buildConfigField("String", "APP_WEB_URL", "\"https://second.risedie.ru/web\"")
-        buildConfigField("String", "APP_ALLOWED_HOSTS_JSON", "\"[\\\"second.risedie.ru\\\",\\\"www.second.risedie.ru\\\"]\"")
+        buildConfigField(
+            "String",
+            "APP_ALLOWED_HOSTS_JSON",
+            "\"[\\\"second.risedie.ru\\\",\\\"www.second.risedie.ru\\\"]\""
+        )
     }
 
     buildTypes {
@@ -40,10 +43,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
     }
 
     buildFeatures {
