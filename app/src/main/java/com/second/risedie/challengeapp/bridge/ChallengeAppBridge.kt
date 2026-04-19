@@ -1,7 +1,9 @@
 package com.second.risedie.challengeapp.bridge
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import android.webkit.JavascriptInterface
@@ -13,12 +15,22 @@ import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.time.ZoneId
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ChallengeAppBridge(
     private val activity: ComponentActivity,
@@ -26,22 +38,29 @@ class ChallengeAppBridge(
     private val onNotifyJavascript: (String) -> Unit,
 ) {
     private val context: Context = activity.applicationContext
+    private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val readMutex = Mutex()
+    private val permissionsMutex = Mutex()
+    private val permissionFlowInProgress = AtomicBoolean(false)
 
     private val permissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(DistanceRecord::class),
     )
 
-    private val healthClient: HealthConnectClient? by lazy {
-        when (HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)) {
-            HealthConnectClient.SDK_AVAILABLE -> HealthConnectClient.getOrCreate(context, HEALTH_CONNECT_PACKAGE_NAME)
-            else -> null
+
+    private fun sdkStatus(): Int = HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+
+    private val healthClient: HealthConnectClient?
+        get() = if (sdkStatus() == HealthConnectClient.SDK_AVAILABLE) {
+            HealthConnectClient.getOrCreate(context, HEALTH_CONNECT_PACKAGE_NAME)
+        } else {
+            null
         }
-    }
 
     @JavascriptInterface
     fun getBridgeInfo(): String {
-        val sdkStatus = HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+        val sdkStatus = sdkStatus()
         return JSONObject()
             .put("bridge", "ChallengeAppBridge")
             .put("platform", "android")
@@ -55,7 +74,7 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun requestActivityPermissions(): String {
-        val sdkStatus = HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+        val sdkStatus = sdkStatus()
         if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
             return unavailablePayload(sdkStatus)
         }
@@ -64,44 +83,65 @@ class ChallengeAppBridge(
         val grantedPermissions = safeGrantedPermissions(client)
 
         if (grantedPermissions.containsAll(permissions)) {
-            return JSONObject()
-                .put("available", true)
-                .put("granted", true)
-                .put("pending", false)
-                .put("message", "Разрешения уже выданы.")
-                .toString()
+            return permissionPayload(
+                available = true,
+                granted = true,
+                pending = false,
+                message = "Разрешения Health Connect уже выданы.",
+            )
         }
 
-        val intent = PermissionController.createRequestPermissionResultContract()
-            .createIntent(activity, permissions)
+        if (!permissionFlowInProgress.compareAndSet(false, true)) {
+            return permissionPayload(
+                available = true,
+                granted = false,
+                pending = true,
+                message = "Окно разрешений уже открыто. Подтверди доступ и вернись в приложение.",
+            )
+        }
 
-        onLaunchPermissions(intent)
+        bridgeScope.launch {
+            try {
+                val intent = PermissionController.createRequestPermissionResultContract()
+                    .createIntent(activity, permissions)
+                onLaunchPermissions(intent)
+            } catch (error: Throwable) {
+                permissionFlowInProgress.set(false)
+                onNotifyJavascript(
+                    permissionPayload(
+                        available = true,
+                        granted = false,
+                        pending = false,
+                        message = error.message ?: "Не удалось открыть окно разрешений Health Connect.",
+                    )
+                )
+            }
+        }
 
-        return JSONObject()
-            .put("available", true)
-            .put("granted", false)
-            .put("pending", true)
-            .put("message", "Открыто окно Health Connect. Разреши доступ к шагам и дистанции.")
-            .toString()
+        return permissionPayload(
+            available = true,
+            granted = false,
+            pending = true,
+            message = "Открыто окно Health Connect. Разреши доступ к шагам и дистанции.",
+        )
     }
 
     fun onPermissionsFlowFinished() {
-        val client = healthClient
-        val granted = client != null && safeGrantedPermissions(client).containsAll(permissions)
+        permissionFlowInProgress.set(false)
+        notifyPermissionState()
+    }
 
-        val payload = JSONObject()
-            .put("available", client != null)
-            .put("granted", granted)
-            .put("pending", false)
-            .put("message", if (granted) "Разрешения получены." else "Разрешения не выданы полностью.")
-            .toString()
+    fun onHostResumed() {
+        notifyPermissionState()
+    }
 
-        onNotifyJavascript(payload)
+    fun dispose() {
+        bridgeScope.cancel()
     }
 
     @JavascriptInterface
     fun getActivitySyncPayload(): String {
-        val sdkStatus = HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+        val sdkStatus = sdkStatus()
         if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
             return JSONObject()
                 .put("batches", JSONArray())
@@ -123,69 +163,15 @@ class ChallengeAppBridge(
         }
 
         return try {
-            val zoneId = ZoneId.systemDefault()
-            val now = Instant.now()
-            val startOfDay = now.atZone(zoneId).toLocalDate().atStartOfDay(zoneId).toInstant()
-
-            val stepsTotal = runBlocking {
-                val response = client.aggregate(
-                    AggregateRequest(
-                        metrics = setOf(StepsRecord.COUNT_TOTAL),
-                        timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
-                    )
-                )
-                response[StepsRecord.COUNT_TOTAL] ?: 0L
+            runBlocking {
+                withTimeout(10_000) {
+                    readMutex.withLock {
+                        withContext(Dispatchers.IO) {
+                            buildActivityPayload(client)
+                        }
+                    }
+                }
             }
-
-            val distanceMeters = runBlocking {
-                val response = client.aggregate(
-                    AggregateRequest(
-                        metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
-                        timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
-                    )
-                )
-                response[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
-            }
-
-            val batches = JSONArray()
-            if (stepsTotal > 0L) {
-                batches.put(
-                    JSONObject()
-                        .put("kind", "walk_steps")
-                        .put("external_batch_id", "android-steps-${startOfDay.epochSecond}")
-                        .put("records", JSONArray().put(
-                            JSONObject()
-                                .put("activity_type", "walk")
-                                .put("metric_type", "steps")
-                                .put("value", stepsTotal)
-                                .put("recorded_from", startOfDay.toString())
-                                .put("recorded_to", now.toString())
-                                .put("source_hash", "android-steps-${startOfDay.epochSecond}-$stepsTotal")
-                        ))
-                )
-            }
-            if (distanceMeters > 0.0) {
-                val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()
-                batches.put(
-                    JSONObject()
-                        .put("kind", "run_distance")
-                        .put("external_batch_id", "android-distance-${startOfDay.epochSecond}")
-                        .put("records", JSONArray().put(
-                            JSONObject()
-                                .put("activity_type", "run")
-                                .put("metric_type", "meters")
-                                .put("value", normalizedDistance)
-                                .put("recorded_from", startOfDay.toString())
-                                .put("recorded_to", now.toString())
-                                .put("source_hash", "android-distance-${startOfDay.epochSecond}-$normalizedDistance")
-                        ))
-                )
-            }
-
-            JSONObject()
-                .put("batches", batches)
-                .put("generated_at", now.toString())
-                .toString()
         } catch (error: Throwable) {
             JSONObject()
                 .put("batches", JSONArray())
@@ -196,32 +182,146 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun openHealthConnectSettings(): String {
-        return try {
-            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                .setData(android.net.Uri.parse("package:$HEALTH_CONNECT_PACKAGE_NAME"))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            activity.startActivity(intent)
-            JSONObject().put("opened", true).toString()
-        } catch (_: Throwable) {
-            JSONObject().put("opened", false).toString()
+        val candidates = listOf(
+            Intent("androidx.health.ACTION_HEALTH_CONNECT_SETTINGS"),
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.parse("package:$HEALTH_CONNECT_PACKAGE_NAME")),
+        )
+
+        for (intent in candidates) {
+            try {
+                activity.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return JSONObject().put("opened", true).toString()
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: Throwable) {
+            }
+        }
+
+        return JSONObject().put("opened", false).toString()
+    }
+
+    private fun notifyPermissionState() {
+        bridgeScope.launch {
+            val client = healthClient
+            val granted = client != null && safeGrantedPermissions(client).containsAll(permissions)
+            onNotifyJavascript(
+                permissionPayload(
+                    available = client != null,
+                    granted = granted,
+                    pending = false,
+                    message = if (granted) {
+                        "Разрешения получены. Можно синхронизировать шаги и дистанцию."
+                    } else {
+                        "Разрешения не выданы полностью."
+                    },
+                )
+            )
         }
     }
 
     private fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
         return try {
-            runBlocking { client.permissionController.getGrantedPermissions() }
+            runBlocking {
+                withTimeout(5_000) {
+                    permissionsMutex.withLock {
+                        withContext(Dispatchers.IO) {
+                            client.permissionController.getGrantedPermissions()
+                        }
+                    }
+                }
+            }
         } catch (_: Throwable) {
             emptySet()
         }
     }
 
-    private fun unavailablePayload(sdkStatus: Int): String {
+    private suspend fun buildActivityPayload(client: HealthConnectClient): String {
+        val zoneId = ZoneId.systemDefault()
+        val now = Instant.now()
+        val startOfDay = now.atZone(zoneId).toLocalDate().atStartOfDay(zoneId).toInstant()
+
+        val stepsTotal = client.aggregate(
+            AggregateRequest(
+                metrics = setOf(StepsRecord.COUNT_TOTAL),
+                timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
+            )
+        )[StepsRecord.COUNT_TOTAL] ?: 0L
+
+        val distanceMeters = client.aggregate(
+            AggregateRequest(
+                metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+                timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
+            )
+        )[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
+
+        val batches = JSONArray()
+        if (stepsTotal > 0L) {
+            batches.put(
+                JSONObject()
+                    .put("kind", "walk_steps")
+                    .put("external_batch_id", "android-steps-${startOfDay.epochSecond}")
+                    .put(
+                        "records",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("activity_type", "walk")
+                                .put("metric_type", "steps")
+                                .put("value", stepsTotal)
+                                .put("recorded_from", startOfDay.toString())
+                                .put("recorded_to", now.toString())
+                                .put("source_hash", "android-steps-${startOfDay.epochSecond}-$stepsTotal")
+                        )
+                    )
+            )
+        }
+        if (distanceMeters > 0.0) {
+            val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()
+            batches.put(
+                JSONObject()
+                    .put("kind", "run_distance")
+                    .put("external_batch_id", "android-distance-${startOfDay.epochSecond}")
+                    .put(
+                        "records",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("activity_type", "run")
+                                .put("metric_type", "meters")
+                                .put("value", normalizedDistance)
+                                .put("recorded_from", startOfDay.toString())
+                                .put("recorded_to", now.toString())
+                                .put("source_hash", "android-distance-${startOfDay.epochSecond}-$normalizedDistance")
+                        )
+                    )
+            )
+        }
+
         return JSONObject()
-            .put("available", false)
-            .put("granted", false)
-            .put("pending", false)
-            .put("message", unavailableMessage(sdkStatus))
+            .put("batches", batches)
+            .put("generated_at", now.toString())
             .toString()
+    }
+
+    private fun permissionPayload(
+        available: Boolean,
+        granted: Boolean,
+        pending: Boolean,
+        message: String,
+    ): String {
+        return JSONObject()
+            .put("available", available)
+            .put("granted", granted)
+            .put("pending", pending)
+            .put("message", message)
+            .toString()
+    }
+
+    private fun unavailablePayload(sdkStatus: Int): String {
+        return permissionPayload(
+            available = false,
+            granted = false,
+            pending = false,
+            message = unavailableMessage(sdkStatus),
+        )
     }
 
     private fun unavailableMessage(sdkStatus: Int): String {

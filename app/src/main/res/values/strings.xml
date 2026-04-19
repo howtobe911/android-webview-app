@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">GraFit</string>
+    <string name="app_name">Challenge app</string>
     <string name="health_connect_unavailable">Health Connect недоступен на этом устройстве.</string>
 </resources>

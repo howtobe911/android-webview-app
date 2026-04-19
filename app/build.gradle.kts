@@ -6,6 +6,30 @@ android {
     namespace = "com.second.risedie.challengeapp"
     compileSdk = 36
 
+    signingConfigs {
+        create("release") {
+            val ci = System.getenv("CI") == "true"
+            if (ci) {
+                val keystorePath = System.getenv("CM_KEYSTORE_PATH")
+                val keystorePassword = System.getenv("CM_KEYSTORE_PASSWORD")
+                val keyAliasEnv = System.getenv("CM_KEY_ALIAS")
+                val keyPasswordEnv = System.getenv("CM_KEY_PASSWORD")
+
+                if (
+                    !keystorePath.isNullOrBlank() &&
+                    !keystorePassword.isNullOrBlank() &&
+                    !keyAliasEnv.isNullOrBlank() &&
+                    !keyPasswordEnv.isNullOrBlank()
+                ) {
+                    storeFile = file(keystorePath)
+                    storePassword = keystorePassword
+                    keyAlias = keyAliasEnv
+                    keyPassword = keyPasswordEnv
+                }
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "com.second.risedie.challengeapp"
         minSdk = 28
@@ -14,6 +38,7 @@ android {
         versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         vectorDrawables {
             useSupportLibrary = true
         }
@@ -29,11 +54,13 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
+                "proguard-rules.pro"
             )
         }
+
         debug {
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"

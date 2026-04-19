@@ -66,6 +66,11 @@ class ChallengeWebViewActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        bridge.onHostResumed()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView(target: WebView) {
         CookieManager.getInstance().setAcceptCookie(true)
@@ -74,6 +79,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         with(target.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
+            @Suppress("DEPRECATION")
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_DEFAULT
@@ -85,7 +91,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             allowContentAccess = false
             setSupportMultipleWindows(false)
             javaScriptCanOpenWindowsAutomatically = false
-            userAgentString = userAgentString + " GraFitWebView/2.0"
+            userAgentString = userAgentString + " ChallengeAppWebView/3.0"
         }
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
@@ -106,7 +112,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             override fun onReceivedError(
                 view: WebView?,
                 request: WebResourceRequest?,
-                error: WebResourceError?
+                error: WebResourceError?,
             ) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
@@ -133,7 +139,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
         """.trimIndent()
 
         webView.post {
-            webView.evaluateJavascript(script, null)
+            if (!isFinishing && !isDestroyed) {
+                webView.evaluateJavascript(script, null)
+            }
         }
     }
 
@@ -167,14 +175,12 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-    webView.removeJavascriptInterface("ChallengeAppBridge")
-
-    webView.stopLoading()
-
-    webView.webChromeClient = WebChromeClient()
-    webView.webViewClient = WebViewClient()
-
-    webView.destroy()
-    super.onDestroy()
-   }
+        webView.removeJavascriptInterface("ChallengeAppBridge")
+        webView.stopLoading()
+        webView.webChromeClient = WebChromeClient()
+        webView.webViewClient = WebViewClient()
+        bridge.dispose()
+        webView.destroy()
+        super.onDestroy()
+    }
 }
