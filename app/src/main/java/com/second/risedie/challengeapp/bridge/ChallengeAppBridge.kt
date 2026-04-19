@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ChallengeAppBridge(
     private val activity: ComponentActivity,
     private val onLaunchPermissions: (Intent) -> Unit,
+    private val onLaunchActivityRecognitionPermission: (String) -> Unit,
+    private val isActivityRecognitionGranted: () -> Boolean,
     private val onNotifyJavascript: (String) -> Unit,
 ) {
     private val context: Context = activity.applicationContext
@@ -96,11 +98,23 @@ class ChallengeAppBridge(
             .put("sdk_status", status)
             .put("available", status == HealthConnectClient.SDK_AVAILABLE)
             .put("permissions", JSONArray(permissions.toList()))
+            .put("activity_recognition_granted", isActivityRecognitionGranted())
             .toString()
     }
 
     @JavascriptInterface
     fun requestActivityPermissions(): String {
+        if (!ensureActivityRecognitionPermission()) {
+            val payload = permissionPayload(
+                available = true,
+                granted = false,
+                pending = true,
+                message = "Сначала нужно дать системное разрешение на физическую активность. После этого сразу откроется Health Connect.",
+            )
+            cachedPermissionPayload = payload
+            return payload
+        }
+
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
             val payload = unavailablePayload(status)
@@ -177,6 +191,23 @@ class ChallengeAppBridge(
         refreshPermissionState(notifyJavascript = true, refreshActivity = true)
     }
 
+    fun onActivityRecognitionPermissionResult(granted: Boolean) {
+        if (granted) {
+            requestActivityPermissions()
+            return
+        }
+
+        permissionFlowInProgress.set(false)
+        val payload = permissionPayload(
+            available = true,
+            granted = false,
+            pending = false,
+            message = "Без разрешения на физическую активность Android не даст приложению доступ к шагам и не покажет его в системном списке.",
+        )
+        cachedPermissionPayload = payload
+        onNotifyJavascript(payload)
+    }
+
     fun onHostResumed() {
         refreshPermissionState(notifyJavascript = true, refreshActivity = false)
     }
@@ -218,7 +249,14 @@ class ChallengeAppBridge(
         bridgeScope.launch {
             val payload = try {
                 val status = sdkStatus()
-                if (status != HealthConnectClient.SDK_AVAILABLE) {
+                if (!isActivityRecognitionGranted()) {
+                    permissionPayload(
+                        available = true,
+                        granted = false,
+                        pending = false,
+                        message = "Системное разрешение на физическую активность ещё не выдано.",
+                    )
+                } else if (status != HealthConnectClient.SDK_AVAILABLE) {
                     unavailablePayload(status)
                 } else {
                     val client = healthClient
@@ -284,6 +322,11 @@ class ChallengeAppBridge(
                         .put("message", unavailableMessage(status))
                         .toString()
 
+                    !isActivityRecognitionGranted() -> JSONObject()
+                        .put("batches", JSONArray())
+                        .put("message", "Нет системного разрешения на физическую активность.")
+                        .toString()
+
                     healthClient == null -> JSONObject()
                         .put("batches", JSONArray())
                         .put("message", "Health Connect не инициализировался.")
@@ -318,6 +361,26 @@ class ChallengeAppBridge(
             } finally {
                 activityRefreshInProgress.set(false)
             }
+        }
+    }
+
+
+
+    private fun ensureActivityRecognitionPermission(): Boolean {
+        if (isActivityRecognitionGranted()) {
+            return true
+        }
+
+        if (!permissionFlowInProgress.compareAndSet(false, true)) {
+            return false
+        }
+
+        return try {
+            onLaunchActivityRecognitionPermission(android.Manifest.permission.ACTIVITY_RECOGNITION)
+            false
+        } catch (_: Throwable) {
+            permissionFlowInProgress.set(false)
+            false
         }
     }
 

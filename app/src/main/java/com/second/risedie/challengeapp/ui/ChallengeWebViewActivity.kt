@@ -1,9 +1,12 @@
 package com.second.risedie.challengeapp.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
@@ -16,6 +19,7 @@ import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
@@ -34,6 +38,11 @@ class ChallengeWebViewActivity : ComponentActivity() {
             bridge.onPermissionsFlowFinished()
         }
 
+    private val activityRecognitionPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            bridge.onActivityRecognitionPermissionResult(granted)
+        }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,6 +54,10 @@ class ChallengeWebViewActivity : ComponentActivity() {
         bridge = ChallengeAppBridge(
             activity = this,
             onLaunchPermissions = { intent -> healthPermissionLauncher.launch(intent) },
+            onLaunchActivityRecognitionPermission = { permission ->
+                activityRecognitionPermissionLauncher.launch(permission)
+            },
+            isActivityRecognitionGranted = { isActivityRecognitionGranted() },
             onNotifyJavascript = { eventJson -> dispatchJavascriptEvent(eventJson) },
         )
 
@@ -150,6 +163,17 @@ class ChallengeWebViewActivity : ComponentActivity() {
         if (scheme != "https") return false
         val host = uri.host?.lowercase() ?: return false
         return host in allowedHosts
+    }
+
+    private fun isActivityRecognitionGranted(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return true
+        }
+
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACTIVITY_RECOGNITION,
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun openExternal(uri: Uri) {
