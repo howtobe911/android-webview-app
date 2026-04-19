@@ -17,37 +17,37 @@ workflows:
           ./gradlew --no-daemon clean app:assembleDebug
     artifacts:
       - app/build/outputs/apk/debug/*.apk
+android_webview_release:
+  name: GraFit Android WebView Release
+  environment:
+    java: 21
+    groups:
+      - keystore
+    vars:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+  cache:
+    cache_paths:
+      - ~/.gradle/caches
+      - ~/.gradle/wrapper
+  scripts:
+    - name: Decode keystore
+      script: |
+        printf '%s' "$CM_KEYSTORE" | tr -d '\r\n ' | base64 --decode > app/keystore.jks
 
-  android_webview_release:
-    name: GraFit Android WebView Release
-    environment:
-      java: 21
-      groups:
-        - keystore
-      vars:
-        GRADLE_OPTS: >-
-          -Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-    cache:
-      cache_paths:
-        - ~/.gradle/caches
-        - ~/.gradle/wrapper
-    scripts:
-      - name: Decode keystore
-        script: |
-          printf '%s' "$CM_KEYSTORE" | tr -d '\r\n ' | base64 --decode > keystore.jks
+    - name: Verify keystore
+      script: |
+        test -s app/keystore.jks
 
-      - name: Verify keystore
-        script: |
-          test -s keystore.jks
-
-      - name: Build signed APK
-        script: |
-          chmod +x ./gradlew
-          ./gradlew --no-daemon clean \
-            -Pandroid.injected.signing.store.file=keystore.jks \
-            -Pandroid.injected.signing.store.password="$CM_KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$CM_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$CM_KEY_PASSWORD" \
-            app:assembleRelease
-    artifacts:
-      - app/build/outputs/apk/release/*.apk
+    - name: Build signed APK
+      script: |
+        chmod +x ./gradlew
+        ./gradlew --no-daemon clean \
+          -Pandroid.injected.signing.store.file=app/keystore.jks \
+          -Pandroid.injected.signing.store.password="$CM_KEYSTORE_PASSWORD" \
+          -Pandroid.injected.signing.key.alias="$CM_KEY_ALIAS" \
+          -Pandroid.injected.signing.key.password="$CM_KEY_PASSWORD" \
+          app:assembleRelease
+  artifacts:
+    - app/build/outputs/apk/release/*.apk
+  
