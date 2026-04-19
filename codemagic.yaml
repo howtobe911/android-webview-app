@@ -5,7 +5,7 @@ workflows:
       java: 21
       vars:
         GRADLE_OPTS: >-
-          -Dorg.gradle.jvmargs='-Xmx2048m -Dfile.encoding=UTF-8'
+          -Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
     cache:
       cache_paths:
         - ~/.gradle/caches
@@ -26,7 +26,7 @@ workflows:
         - keystore
       vars:
         GRADLE_OPTS: >-
-          -Dorg.gradle.jvmargs='-Xmx2048m -Dfile.encoding=UTF-8'
+          -Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
     cache:
       cache_paths:
         - ~/.gradle/caches
@@ -34,7 +34,11 @@ workflows:
     scripts:
       - name: Decode keystore
         script: |
-          echo "$CM_KEYSTORE" | base64 --decode > keystore.jks
+          printf '%s' "$CM_KEYSTORE" | tr -d '\r\n ' | base64 --decode > keystore.jks
+
+      - name: Verify keystore
+        script: |
+          test -s keystore.jks
 
       - name: Build signed APK
         script: |
