@@ -20,7 +20,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -42,97 +41,144 @@ class ChallengeAppBridge(
     private val readMutex = Mutex()
     private val permissionsMutex = Mutex()
     private val permissionFlowInProgress = AtomicBoolean(false)
+    private val activityRefreshInProgress = AtomicBoolean(false)
+
+    @Volatile
+    private var cachedPermissionPayload: String = permissionPayload(
+        available = false,
+        granted = false,
+        pending = false,
+        message = "Проверяем доступность Health Connect.",
+    )
+
+    @Volatile
+    private var cachedActivityPayload: String = JSONObject()
+        .put("batches", JSONArray())
+        .put("message", "Синхронизация активности ещё не выполнялась.")
+        .toString()
 
     private val permissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(DistanceRecord::class),
     )
 
+    init {
+        refreshPermissionState(notifyJavascript = false, refreshActivity = false)
+    }
 
-    private fun sdkStatus(): Int = HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+    private fun sdkStatus(): Int {
+        return try {
+            HealthConnectClient.getSdkStatus(context, HEALTH_CONNECT_PACKAGE_NAME)
+        } catch (_: Throwable) {
+            HealthConnectClient.SDK_UNAVAILABLE
+        }
+    }
 
     private val healthClient: HealthConnectClient?
         get() = if (sdkStatus() == HealthConnectClient.SDK_AVAILABLE) {
-            HealthConnectClient.getOrCreate(context, HEALTH_CONNECT_PACKAGE_NAME)
+            try {
+                HealthConnectClient.getOrCreate(context, HEALTH_CONNECT_PACKAGE_NAME)
+            } catch (_: Throwable) {
+                null
+            }
         } else {
             null
         }
 
     @JavascriptInterface
     fun getBridgeInfo(): String {
-        val sdkStatus = sdkStatus()
+        val status = sdkStatus()
         return JSONObject()
             .put("bridge", "ChallengeAppBridge")
             .put("platform", "android")
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("health_connect_package", HEALTH_CONNECT_PACKAGE_NAME)
-            .put("sdk_status", sdkStatus)
-            .put("available", sdkStatus == HealthConnectClient.SDK_AVAILABLE)
+            .put("sdk_status", status)
+            .put("available", status == HealthConnectClient.SDK_AVAILABLE)
             .put("permissions", JSONArray(permissions.toList()))
             .toString()
     }
 
     @JavascriptInterface
     fun requestActivityPermissions(): String {
-        val sdkStatus = sdkStatus()
-        if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
-            return unavailablePayload(sdkStatus)
-        }
-
-        val client = healthClient ?: return unavailablePayload(sdkStatus)
-        val grantedPermissions = safeGrantedPermissions(client)
-
-        if (grantedPermissions.containsAll(permissions)) {
-            return permissionPayload(
-                available = true,
-                granted = true,
-                pending = false,
-                message = "Разрешения Health Connect уже выданы.",
-            )
+        val status = sdkStatus()
+        if (status != HealthConnectClient.SDK_AVAILABLE) {
+            val payload = unavailablePayload(status)
+            cachedPermissionPayload = payload
+            return payload
         }
 
         if (!permissionFlowInProgress.compareAndSet(false, true)) {
-            return permissionPayload(
+            val payload = permissionPayload(
                 available = true,
                 granted = false,
                 pending = true,
                 message = "Окно разрешений уже открыто. Подтверди доступ и вернись в приложение.",
             )
+            cachedPermissionPayload = payload
+            return payload
         }
+
+        val pendingPayload = permissionPayload(
+            available = true,
+            granted = false,
+            pending = true,
+            message = "Проверяем разрешения и открываем окно Health Connect при необходимости.",
+        )
+        cachedPermissionPayload = pendingPayload
 
         bridgeScope.launch {
             try {
+                val client = healthClient
+                if (client == null) {
+                    permissionFlowInProgress.set(false)
+                    val payload = unavailablePayload(sdkStatus())
+                    cachedPermissionPayload = payload
+                    onNotifyJavascript(payload)
+                    return@launch
+                }
+
+                val grantedPermissions = safeGrantedPermissions(client)
+                if (grantedPermissions.containsAll(permissions)) {
+                    permissionFlowInProgress.set(false)
+                    val grantedPayload = permissionPayload(
+                        available = true,
+                        granted = true,
+                        pending = false,
+                        message = "Разрешения Health Connect уже выданы.",
+                    )
+                    cachedPermissionPayload = grantedPayload
+                    onNotifyJavascript(grantedPayload)
+                    refreshActivityPayload()
+                    return@launch
+                }
+
                 val intent = PermissionController.createRequestPermissionResultContract()
                     .createIntent(activity, permissions)
                 onLaunchPermissions(intent)
             } catch (error: Throwable) {
                 permissionFlowInProgress.set(false)
-                onNotifyJavascript(
-                    permissionPayload(
-                        available = true,
-                        granted = false,
-                        pending = false,
-                        message = error.message ?: "Не удалось открыть окно разрешений Health Connect.",
-                    )
+                val payload = permissionPayload(
+                    available = true,
+                    granted = false,
+                    pending = false,
+                    message = error.message ?: "Не удалось открыть окно разрешений Health Connect.",
                 )
+                cachedPermissionPayload = payload
+                onNotifyJavascript(payload)
             }
         }
 
-        return permissionPayload(
-            available = true,
-            granted = false,
-            pending = true,
-            message = "Открыто окно Health Connect. Разреши доступ к шагам и дистанции.",
-        )
+        return pendingPayload
     }
 
     fun onPermissionsFlowFinished() {
         permissionFlowInProgress.set(false)
-        notifyPermissionState()
+        refreshPermissionState(notifyJavascript = true, refreshActivity = true)
     }
 
     fun onHostResumed() {
-        notifyPermissionState()
+        refreshPermissionState(notifyJavascript = true, refreshActivity = false)
     }
 
     fun dispose() {
@@ -141,43 +187,8 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun getActivitySyncPayload(): String {
-        val sdkStatus = sdkStatus()
-        if (sdkStatus != HealthConnectClient.SDK_AVAILABLE) {
-            return JSONObject()
-                .put("batches", JSONArray())
-                .put("message", unavailableMessage(sdkStatus))
-                .toString()
-        }
-
-        val client = healthClient ?: return JSONObject()
-            .put("batches", JSONArray())
-            .put("message", "Health Connect не инициализировался.")
-            .toString()
-
-        val grantedPermissions = safeGrantedPermissions(client)
-        if (!grantedPermissions.containsAll(permissions)) {
-            return JSONObject()
-                .put("batches", JSONArray())
-                .put("message", "Разрешения на шаги и дистанцию ещё не выданы.")
-                .toString()
-        }
-
-        return try {
-            runBlocking {
-                withTimeout(10_000) {
-                    readMutex.withLock {
-                        withContext(Dispatchers.IO) {
-                            buildActivityPayload(client)
-                        }
-                    }
-                }
-            }
-        } catch (error: Throwable) {
-            JSONObject()
-                .put("batches", JSONArray())
-                .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
-                .toString()
-        }
+        refreshActivityPayload()
+        return cachedActivityPayload
     }
 
     @JavascriptInterface
@@ -200,33 +211,122 @@ class ChallengeAppBridge(
         return JSONObject().put("opened", false).toString()
     }
 
-    private fun notifyPermissionState() {
+    private fun refreshPermissionState(
+        notifyJavascript: Boolean,
+        refreshActivity: Boolean,
+    ) {
         bridgeScope.launch {
-            val client = healthClient
-            val granted = client != null && safeGrantedPermissions(client).containsAll(permissions)
-            onNotifyJavascript(
-                permissionPayload(
-                    available = client != null,
-                    granted = granted,
-                    pending = false,
-                    message = if (granted) {
-                        "Разрешения получены. Можно синхронизировать шаги и дистанцию."
+            val payload = try {
+                val status = sdkStatus()
+                if (status != HealthConnectClient.SDK_AVAILABLE) {
+                    unavailablePayload(status)
+                } else {
+                    val client = healthClient
+                    if (client == null) {
+                        permissionPayload(
+                            available = false,
+                            granted = false,
+                            pending = false,
+                            message = "Health Connect не инициализировался.",
+                        )
                     } else {
-                        "Разрешения не выданы полностью."
-                    },
+                        val granted = safeGrantedPermissions(client).containsAll(permissions)
+                        permissionPayload(
+                            available = true,
+                            granted = granted,
+                            pending = permissionFlowInProgress.get(),
+                            message = if (granted) {
+                                "Разрешения получены. Можно синхронизировать шаги и дистанцию."
+                            } else {
+                                "Разрешения на шаги и дистанцию пока не выданы."
+                            },
+                        )
+                    }
+                }
+            } catch (error: Throwable) {
+                permissionPayload(
+                    available = false,
+                    granted = false,
+                    pending = false,
+                    message = error.message ?: "Не удалось проверить состояние Health Connect.",
                 )
-            )
+            }
+
+            cachedPermissionPayload = payload
+
+            if (notifyJavascript) {
+                onNotifyJavascript(payload)
+            }
+
+            val payloadJson = try {
+                JSONObject(payload)
+            } catch (_: Throwable) {
+                null
+            }
+
+            if (refreshActivity && payloadJson?.optBoolean("granted") == true) {
+                refreshActivityPayload()
+            }
         }
     }
 
-    private fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
-        return try {
-            runBlocking {
-                withTimeout(5_000) {
-                    permissionsMutex.withLock {
-                        withContext(Dispatchers.IO) {
-                            client.permissionController.getGrantedPermissions()
+    private fun refreshActivityPayload() {
+        if (!activityRefreshInProgress.compareAndSet(false, true)) {
+            return
+        }
+
+        bridgeScope.launch {
+            try {
+                val status = sdkStatus()
+                val payload = when {
+                    status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
+                        .put("batches", JSONArray())
+                        .put("message", unavailableMessage(status))
+                        .toString()
+
+                    healthClient == null -> JSONObject()
+                        .put("batches", JSONArray())
+                        .put("message", "Health Connect не инициализировался.")
+                        .toString()
+
+                    else -> {
+                        val client = healthClient!!
+                        val granted = safeGrantedPermissions(client)
+                        if (!granted.containsAll(permissions)) {
+                            JSONObject()
+                                .put("batches", JSONArray())
+                                .put("message", "Разрешения на шаги и дистанцию ещё не выданы.")
+                                .toString()
+                        } else {
+                            withTimeout(10_000) {
+                                readMutex.withLock {
+                                    withContext(Dispatchers.IO) {
+                                        buildActivityPayload(client)
+                                    }
+                                }
+                            }
                         }
+                    }
+                }
+
+                cachedActivityPayload = payload
+            } catch (error: Throwable) {
+                cachedActivityPayload = JSONObject()
+                    .put("batches", JSONArray())
+                    .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
+                    .toString()
+            } finally {
+                activityRefreshInProgress.set(false)
+            }
+        }
+    }
+
+    private suspend fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
+        return try {
+            withTimeout(5_000) {
+                permissionsMutex.withLock {
+                    withContext(Dispatchers.IO) {
+                        client.permissionController.getGrantedPermissions()
                     }
                 }
             }

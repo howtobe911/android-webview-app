@@ -1,0 +1,7 @@
+Placeholder URL for your future launcher icon:
+https://cdn.example.com/mobile-icons/challenge_app_icon_from_server.png
+
+Replace the file at:
+app/src/main/res/drawable-nodpi/challenge_app_icon_from_server.png
+
+Keep the same filename, then rebuild the Android app.
