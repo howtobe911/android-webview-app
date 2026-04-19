@@ -22,6 +22,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -218,8 +219,11 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun getActivitySyncPayload(): String {
-        refreshActivityPayload()
-        return cachedActivityPayload
+        return runBlocking {
+            val payload = readActivityPayloadOnce()
+            cachedActivityPayload = payload
+            payload
+        }
     }
 
     @JavascriptInterface
@@ -315,52 +319,56 @@ class ChallengeAppBridge(
 
         bridgeScope.launch {
             try {
-                val status = sdkStatus()
-                val payload = when {
-                    status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
-                        .put("batches", JSONArray())
-                        .put("message", unavailableMessage(status))
-                        .toString()
+                cachedActivityPayload = readActivityPayloadOnce()
+            } finally {
+                activityRefreshInProgress.set(false)
+            }
+        }
+    }
 
-                    !isActivityRecognitionGranted() -> JSONObject()
-                        .put("batches", JSONArray())
-                        .put("message", "Нет системного разрешения на физическую активность.")
-                        .toString()
+    private suspend fun readActivityPayloadOnce(): String {
+        return try {
+            val status = sdkStatus()
+            when {
+                status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
+                    .put("batches", JSONArray())
+                    .put("message", unavailableMessage(status))
+                    .toString()
 
-                    healthClient == null -> JSONObject()
-                        .put("batches", JSONArray())
-                        .put("message", "Health Connect не инициализировался.")
-                        .toString()
+                !isActivityRecognitionGranted() -> JSONObject()
+                    .put("batches", JSONArray())
+                    .put("message", "Нет системного разрешения на физическую активность.")
+                    .toString()
 
-                    else -> {
-                        val client = healthClient!!
-                        val granted = safeGrantedPermissions(client)
-                        if (!granted.containsAll(permissions)) {
-                            JSONObject()
-                                .put("batches", JSONArray())
-                                .put("message", "Разрешения на шаги и дистанцию ещё не выданы.")
-                                .toString()
-                        } else {
-                            withTimeout(10_000) {
-                                readMutex.withLock {
-                                    withContext(Dispatchers.IO) {
-                                        buildActivityPayload(client)
-                                    }
+                healthClient == null -> JSONObject()
+                    .put("batches", JSONArray())
+                    .put("message", "Health Connect не инициализировался.")
+                    .toString()
+
+                else -> {
+                    val client = healthClient!!
+                    val granted = safeGrantedPermissions(client)
+                    if (!granted.containsAll(permissions)) {
+                        JSONObject()
+                            .put("batches", JSONArray())
+                            .put("message", "Разрешения на шаги и дистанцию ещё не выданы.")
+                            .toString()
+                    } else {
+                        withTimeout(10_000) {
+                            readMutex.withLock {
+                                withContext(Dispatchers.IO) {
+                                    buildActivityPayload(client)
                                 }
                             }
                         }
                     }
                 }
-
-                cachedActivityPayload = payload
-            } catch (error: Throwable) {
-                cachedActivityPayload = JSONObject()
-                    .put("batches", JSONArray())
-                    .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
-                    .toString()
-            } finally {
-                activityRefreshInProgress.set(false)
             }
+        } catch (error: Throwable) {
+            JSONObject()
+                .put("batches", JSONArray())
+                .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
+                .toString()
         }
     }
 
