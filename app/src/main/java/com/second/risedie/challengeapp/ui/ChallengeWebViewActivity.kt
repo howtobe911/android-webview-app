@@ -71,6 +71,8 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
         webView.clearCache(true)
         webView.clearHistory()
+        webView.clearFormData()
+        webView.clearSslPreferences()
 
         if (savedInstanceState == null) {
             val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
@@ -112,6 +114,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_NO_CACHE
+            setAppCacheEnabled(false)
             builtInZoomControls = false
             displayZoomControls = false
             loadsImagesAutomatically = true

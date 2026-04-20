@@ -11,6 +11,7 @@ import android.webkit.JavascriptInterface
 import androidx.activity.ComponentActivity
 import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.HealthConnectClient
+import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
