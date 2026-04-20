@@ -1,3 +1,5 @@
+import java.time.Instant
+
 plugins {
     id("com.android.application")
 }
@@ -34,8 +36,11 @@ android {
         applicationId = "com.second.risedie.challengeapp"
         minSdk = 28
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2.0"
+
+        val dynamicVersionCode = ((Instant.now().epochSecond / 60L).toInt()).coerceAtLeast(1)
+        val dynamicVersionName = "1.2.dev.${dynamicVersionCode}"
+        versionCode = dynamicVersionCode
+        versionName = dynamicVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

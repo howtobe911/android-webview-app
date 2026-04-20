@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -28,6 +29,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class ChallengeWebViewActivity : ComponentActivity() {
+
+    companion object {
+        private const val LOG_TAG = "GrafitActivitySync"
+    }
 
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
@@ -64,8 +69,19 @@ class ChallengeWebViewActivity : ComponentActivity() {
         configureWebView(webView)
         webView.addJavascriptInterface(bridge, "ChallengeAppBridge")
 
+        webView.clearCache(true)
+        webView.clearHistory()
+
         if (savedInstanceState == null) {
-            webView.loadUrl(BuildConfig.APP_WEB_URL)
+            val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
+                .buildUpon()
+                .appendQueryParameter("app_version", BuildConfig.VERSION_NAME)
+                .appendQueryParameter("app_build", BuildConfig.VERSION_CODE.toString())
+                .appendQueryParameter("nocache", System.currentTimeMillis().toString())
+                .build()
+                .toString()
+            Log.d(LOG_TAG, "webview:loadUrl url=$launchUrl")
+            webView.loadUrl(launchUrl)
         } else {
             webView.restoreState(savedInstanceState)
         }
@@ -95,7 +111,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             @Suppress("DEPRECATION")
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_DEFAULT
+            cacheMode = WebSettings.LOAD_NO_CACHE
             builtInZoomControls = false
             displayZoomControls = false
             loadsImagesAutomatically = true
@@ -111,6 +127,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
         target.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    Log.d(LOG_TAG, "webconsole:${it.messageLevel()} ${it.message()} @${it.sourceId()}:${it.lineNumber()}")
+                }
                 return super.onConsoleMessage(consoleMessage)
             }
         }
@@ -120,6 +139,12 @@ class ChallengeWebViewActivity : ComponentActivity() {
                 return !isAllowedInternalUrl(url).also { allowed ->
                     if (!allowed) openExternal(url)
                 }
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                Log.d(LOG_TAG, "webview:onPageFinished url=$url")
+                notifyBridgeReady()
             }
 
             override fun onReceivedError(
@@ -143,6 +168,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     private fun dispatchJavascriptEvent(eventJson: String) {
+        Log.d(LOG_TAG, "dispatchJavascriptEvent payload=$eventJson")
         val quoted = JSONObject.quote(eventJson)
         val script = """
             (function() {
@@ -151,6 +177,17 @@ class ChallengeWebViewActivity : ComponentActivity() {
             })();
         """.trimIndent()
 
+        webView.post {
+            if (!isFinishing && !isDestroyed) {
+                webView.evaluateJavascript(script, null)
+            }
+        }
+    }
+
+
+
+    private fun notifyBridgeReady() {
+        val script = "window.dispatchEvent(new CustomEvent('grafit-native-bridge-ready'));true;"
         webView.post {
             if (!isFinishing && !isDestroyed) {
                 webView.evaluateJavascript(script, null)
