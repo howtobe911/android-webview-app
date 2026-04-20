@@ -43,11 +43,6 @@ class ChallengeWebViewActivity : ComponentActivity() {
             bridge.onPermissionsFlowFinished()
         }
 
-    private val activityRecognitionPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            bridge.onActivityRecognitionPermissionResult(granted)
-        }
-
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,11 +54,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
         bridge = ChallengeAppBridge(
             activity = this,
             onLaunchPermissions = { intent -> healthPermissionLauncher.launch(intent) },
-            onLaunchActivityRecognitionPermission = { permission ->
-                activityRecognitionPermissionLauncher.launch(permission)
-            },
             isActivityRecognitionGranted = { isActivityRecognitionGranted() },
             onNotifyJavascript = { eventJson -> dispatchJavascriptEvent(eventJson) },
+            onDebugJavascript = { eventJson -> dispatchJavascriptDebugEvent(eventJson) },
         )
 
         configureWebView(webView)
@@ -188,6 +181,24 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
 
+
+
+    private fun dispatchJavascriptDebugEvent(eventJson: String) {
+        Log.d(LOG_TAG, "dispatchJavascriptDebugEvent payload=$eventJson")
+        val quoted = JSONObject.quote(eventJson)
+        val script = """
+            (function() {
+                var payload = JSON.parse($quoted);
+                window.dispatchEvent(new CustomEvent('challengeapp:debug-log', { detail: payload }));
+            })();
+        """.trimIndent()
+
+        webView.post {
+            if (!isFinishing && !isDestroyed) {
+                webView.evaluateJavascript(script, null)
+            }
+        }
+    }
 
     private fun notifyBridgeReady() {
         val script = "window.dispatchEvent(new CustomEvent('grafit-native-bridge-ready'));true;"

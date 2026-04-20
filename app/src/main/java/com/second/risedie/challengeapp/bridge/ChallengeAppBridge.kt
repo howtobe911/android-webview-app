@@ -39,9 +39,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ChallengeAppBridge(
     private val activity: ComponentActivity,
     private val onLaunchPermissions: (Intent) -> Unit,
-    private val onLaunchActivityRecognitionPermission: (String) -> Unit,
     private val isActivityRecognitionGranted: () -> Boolean,
     private val onNotifyJavascript: (String) -> Unit,
+    private val onDebugJavascript: (String) -> Unit,
 ) {
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -71,6 +71,7 @@ class ChallengeAppBridge(
 
     init {
         logDebug("bridge:init")
+        emitDebugEvent("bridge:init", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
         refreshPermissionState(notifyJavascript = false, refreshActivity = false)
     }
 
@@ -114,24 +115,14 @@ class ChallengeAppBridge(
     @JavascriptInterface
     fun requestActivityPermissions(): String {
         logDebug("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
-        if (!ensureActivityRecognitionPermission()) {
-            val payload = permissionPayload(
-                available = true,
-                granted = false,
-                pending = true,
-                message = "Сначала нужно дать системное разрешение на физическую активность. После этого сразу откроется Health Connect.",
-            )
-            cachedPermissionPayload = payload
-            logDebug("permissions:refresh:payload", mapOf("payload" to payload))
-            logDebug("permissions:request:activity_recognition_required", mapOf("payload" to payload))
-            return payload
-        }
+        emitDebugEvent("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
 
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
             val payload = unavailablePayload(status)
             cachedPermissionPayload = payload
             logDebug("permissions:request:sdk_unavailable", mapOf("payload" to payload))
+            emitDebugEvent("permissions:request:sdk_unavailable", mapOf("payload" to payload))
             return payload
         }
 
@@ -144,6 +135,7 @@ class ChallengeAppBridge(
             )
             cachedPermissionPayload = payload
             logDebug("permissions:request:flow_already_in_progress", mapOf("payload" to payload))
+            emitDebugEvent("permissions:request:flow_already_in_progress", mapOf("payload" to payload))
             return payload
         }
 
@@ -155,6 +147,7 @@ class ChallengeAppBridge(
         )
         cachedPermissionPayload = pendingPayload
         logDebug("permissions:request:pending", mapOf("payload" to pendingPayload))
+        emitDebugEvent("permissions:request:pending", mapOf("payload" to pendingPayload))
 
         bridgeScope.launch {
             try {
@@ -169,6 +162,7 @@ class ChallengeAppBridge(
 
                 val grantedPermissions = safeGrantedPermissions(client)
                 logDebug("permissions:request:granted_permissions", mapOf("grantedPermissions" to grantedPermissions.joinToString(",")))
+                emitDebugEvent("permissions:request:granted_permissions", mapOf("grantedPermissions" to grantedPermissions.joinToString(",")))
                 if (grantedPermissions.containsAll(permissions)) {
                     permissionFlowInProgress.set(false)
                     val grantedPayload = permissionPayload(
@@ -179,6 +173,7 @@ class ChallengeAppBridge(
                     )
                     cachedPermissionPayload = grantedPayload
                     onNotifyJavascript(grantedPayload)
+                    emitDebugEvent("permissions:request:already_granted", mapOf("payload" to grantedPayload))
                     refreshActivityPayload()
                     return@launch
                 }
@@ -186,6 +181,7 @@ class ChallengeAppBridge(
                 val intent = PermissionController.createRequestPermissionResultContract()
                     .createIntent(activity, permissions)
                 logDebug("permissions:request:launch_health_connect")
+                emitDebugEvent("permissions:request:launch_health_connect", mapOf("permissions" to permissions.joinToString(",")))
                 onLaunchPermissions(intent)
             } catch (error: Throwable) {
                 logError("permissions:request:error", error)
@@ -198,6 +194,7 @@ class ChallengeAppBridge(
                 )
                 cachedPermissionPayload = payload
                 onNotifyJavascript(payload)
+                emitDebugEvent("permissions:request:error", mapOf("message" to (error.message ?: "unknown"), "payload" to payload))
             }
         }
 
@@ -212,20 +209,7 @@ class ChallengeAppBridge(
 
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
         logDebug("permissions:activity_recognition_result", mapOf("granted" to granted))
-        if (granted) {
-            requestActivityPermissions()
-            return
-        }
-
-        permissionFlowInProgress.set(false)
-        val payload = permissionPayload(
-            available = true,
-            granted = false,
-            pending = false,
-            message = "Без разрешения на физическую активность Android не даст приложению доступ к шагам и не покажет его в системном списке.",
-        )
-        cachedPermissionPayload = payload
-        onNotifyJavascript(payload)
+        emitDebugEvent("permissions:activity_recognition_result", mapOf("granted" to granted))
     }
 
     fun onHostResumed() {
@@ -356,16 +340,12 @@ class ChallengeAppBridge(
     private suspend fun readActivityPayloadOnce(): String {
         return try {
             logDebug("sync:read:start", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
+            emitDebugEvent("sync:read:start", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
             val status = sdkStatus()
             when {
                 status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
                     .put("batches", JSONArray())
                     .put("message", unavailableMessage(status))
-                    .toString()
-
-                !isActivityRecognitionGranted() -> JSONObject()
-                    .put("batches", JSONArray())
-                    .put("message", "Нет системного разрешения на физическую активность.")
                     .toString()
 
                 healthClient == null -> JSONObject()
@@ -394,6 +374,7 @@ class ChallengeAppBridge(
             }
         } catch (error: Throwable) {
             logError("sync:read:error", error)
+            emitDebugEvent("sync:read:error", mapOf("message" to (error.message ?: "unknown")))
             JSONObject()
                 .put("batches", JSONArray())
                 .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
@@ -402,26 +383,6 @@ class ChallengeAppBridge(
     }
 
 
-
-    private fun ensureActivityRecognitionPermission(): Boolean {
-        if (isActivityRecognitionGranted()) {
-            return true
-        }
-
-        if (!permissionFlowInProgress.compareAndSet(false, true)) {
-            return false
-        }
-
-        return try {
-            logDebug("permissions:activity_recognition:launch")
-            onLaunchActivityRecognitionPermission(android.Manifest.permission.ACTIVITY_RECOGNITION)
-            false
-        } catch (error: Throwable) {
-            permissionFlowInProgress.set(false)
-            logError("permissions:activity_recognition:error", error)
-            false
-        }
-    }
 
     private suspend fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
         return try {
@@ -440,6 +401,7 @@ class ChallengeAppBridge(
 
     private suspend fun buildActivityPayload(client: HealthConnectClient): String {
         logDebug("sync:build_payload:start")
+        emitDebugEvent("sync:build_payload:start")
         val zoneId = ZoneId.systemDefault()
         val now = Instant.now()
         val startOfDay = now.atZone(zoneId).toLocalDate().atStartOfDay(zoneId).toInstant()
@@ -505,8 +467,23 @@ class ChallengeAppBridge(
             .toString()
 
         logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
+        emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
 
         return payload
+    }
+
+
+    private fun emitDebugEvent(stage: String, payload: Map<String, Any?> = emptyMap()) {
+        val event = JSONObject()
+            .put("stage", stage)
+            .put("payload", JSONObject.wrap(payload) ?: JSONObject())
+            .put("at", Instant.now().toString())
+            .toString()
+
+        try {
+            onDebugJavascript(event)
+        } catch (_: Throwable) {
+        }
     }
 
     private fun permissionPayload(
