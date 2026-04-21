@@ -43,6 +43,11 @@ class ChallengeWebViewActivity : ComponentActivity() {
             bridge.onPermissionsFlowFinished()
         }
 
+    private val activityRecognitionPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            bridge.onActivityRecognitionPermissionResult(granted)
+        }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,6 +59,13 @@ class ChallengeWebViewActivity : ComponentActivity() {
         bridge = ChallengeAppBridge(
             activity = this,
             onLaunchPermissions = { intent -> healthPermissionLauncher.launch(intent) },
+            onLaunchActivityRecognitionPermission = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    activityRecognitionPermissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)
+                } else {
+                    bridge.onActivityRecognitionPermissionResult(true)
+                }
+            },
             isActivityRecognitionGranted = { isActivityRecognitionGranted() },
             onNotifyJavascript = { eventJson -> dispatchJavascriptEvent(eventJson) },
             onDebugJavascript = { eventJson -> dispatchJavascriptDebugEvent(eventJson) },
@@ -107,6 +119,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_NO_CACHE
+            setAppCacheEnabled(false)
             builtInZoomControls = false
             displayZoomControls = false
             loadsImagesAutomatically = true

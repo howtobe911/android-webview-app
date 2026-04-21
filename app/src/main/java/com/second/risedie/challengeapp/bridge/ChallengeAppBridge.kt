@@ -9,8 +9,8 @@ import android.provider.Settings
 import android.util.Log
 import android.webkit.JavascriptInterface
 import androidx.activity.ComponentActivity
-import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.HealthConnectClient
+import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ChallengeAppBridge(
     private val activity: ComponentActivity,
     private val onLaunchPermissions: (Intent) -> Unit,
+    private val onLaunchActivityRecognitionPermission: () -> Unit,
     private val isActivityRecognitionGranted: () -> Boolean,
     private val onNotifyJavascript: (String) -> Unit,
     private val onDebugJavascript: (String) -> Unit,
@@ -118,6 +119,20 @@ class ChallengeAppBridge(
     fun requestActivityPermissions(): String {
         logDebug("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
         emitDebugEvent("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
+
+        if (!isActivityRecognitionGranted()) {
+            val payload = permissionPayload(
+                available = true,
+                granted = false,
+                pending = true,
+                message = "Запрашиваем системное разрешение на физическую активность.",
+            )
+            cachedPermissionPayload = payload
+            logDebug("permissions:request:launch_activity_recognition", mapOf("payload" to payload))
+            emitDebugEvent("permissions:request:launch_activity_recognition", mapOf("payload" to payload))
+            onLaunchActivityRecognitionPermission()
+            return payload
+        }
 
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
@@ -212,6 +227,18 @@ class ChallengeAppBridge(
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
         logDebug("permissions:activity_recognition_result", mapOf("granted" to granted))
         emitDebugEvent("permissions:activity_recognition_result", mapOf("granted" to granted))
+        if (granted) {
+            requestActivityPermissions()
+        } else {
+            val payload = permissionPayload(
+                available = true,
+                granted = false,
+                pending = false,
+                message = "Системное разрешение на физическую активность не выдано.",
+            )
+            cachedPermissionPayload = payload
+            onNotifyJavascript(payload)
+        }
     }
 
     fun onHostResumed() {
@@ -415,17 +442,7 @@ class ChallengeAppBridge(
             )
         )[StepsRecord.COUNT_TOTAL] ?: 0L
 
-        val runningDistanceMeters = client.readRecords(
-            ReadRecordsRequest(
-                recordType = ExerciseSessionRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
-            )
-        ).records.sumOf { session ->
-            when (session.exerciseType) {
-                ExerciseSessionRecord.EXERCISE_TYPE_RUNNING -> sumDistanceMetersForSession(client, session)
-                else -> 0.0
-            }
-        }
+        val distanceMeters = calculateRunningDistanceMeters(client, startOfDay, now)
 
         val batches = JSONArray()
         if (stepsTotal > 0L) {
@@ -447,8 +464,8 @@ class ChallengeAppBridge(
                     )
             )
         }
-        if (runningDistanceMeters > 0.0) {
-            val normalizedDistance = String.format(Locale.US, "%.2f", runningDistanceMeters).toDouble()
+        if (distanceMeters > 0.0) {
+            val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()
             batches.put(
                 JSONObject()
                     .put("kind", "run_distance")
@@ -473,32 +490,44 @@ class ChallengeAppBridge(
             .put("generated_at", now.toString())
             .toString()
 
-        logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to runningDistanceMeters, "batchesCount" to batches.length(), "payload" to payload))
-        emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to runningDistanceMeters, "batchesCount" to batches.length(), "payload" to payload))
+        logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
+        emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
 
         return payload
     }
 
 
-    private suspend fun sumDistanceMetersForSession(
+
+    private suspend fun calculateRunningDistanceMeters(
         client: HealthConnectClient,
-        session: ExerciseSessionRecord,
+        startOfDay: Instant,
+        now: Instant,
     ): Double {
-        return try {
-            client.readRecords(
-                ReadRecordsRequest(
-                    recordType = DistanceRecord::class,
+        val sessions = client.readRecords(
+            ReadRecordsRequest(
+                recordType = ExerciseSessionRecord::class,
+                timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
+            )
+        ).records
+
+        var total = 0.0
+        for (session in sessions) {
+            if (session.exerciseType != ExerciseSessionRecord.EXERCISE_TYPE_RUNNING) {
+                continue
+            }
+
+            val sessionDistance = client.aggregate(
+                AggregateRequest(
+                    metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
                     timeRangeFilter = TimeRangeFilter.between(session.startTime, session.endTime),
                 )
-            ).records.sumOf { distanceRecord ->
-                distanceRecord.distance.inMeters
-            }
-        } catch (error: Throwable) {
-            logError("sync:running_distance_for_session:error", error)
-            0.0
-        }
-    }
+            )[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
 
+            total += sessionDistance
+        }
+
+        return total
+    }
 
     private fun emitDebugEvent(stage: String, payload: Map<String, Any?> = emptyMap()) {
         val event = JSONObject()
