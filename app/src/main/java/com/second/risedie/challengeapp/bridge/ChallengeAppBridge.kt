@@ -15,8 +15,10 @@ import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
+import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.request.AggregateRequest
+import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -67,6 +69,7 @@ class ChallengeAppBridge(
     private val permissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(DistanceRecord::class),
+        HealthPermission.getReadPermission(ExerciseSessionRecord::class),
     )
 
     init {
@@ -413,12 +416,18 @@ class ChallengeAppBridge(
             )
         )[StepsRecord.COUNT_TOTAL] ?: 0L
 
-        val distanceMeters = client.aggregate(
-            AggregateRequest(
-                metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+        val runningDistanceMeters = client.readRecords(
+            ReadRecordsRequest(
+                recordType = ExerciseSessionRecord::class,
                 timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
             )
-        )[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
+        ).records.sumOf { session ->
+            when (session.exerciseType) {
+                ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
+                ExerciseSessionRecord.EXERCISE_TYPE_TREADMILL_RUNNING -> session.totalDistance?.inMeters ?: 0.0
+                else -> 0.0
+            }
+        }
 
         val batches = JSONArray()
         if (stepsTotal > 0L) {
@@ -440,8 +449,8 @@ class ChallengeAppBridge(
                     )
             )
         }
-        if (distanceMeters > 0.0) {
-            val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()
+        if (runningDistanceMeters > 0.0) {
+            val normalizedDistance = String.format(Locale.US, "%.2f", runningDistanceMeters).toDouble()
             batches.put(
                 JSONObject()
                     .put("kind", "run_distance")
