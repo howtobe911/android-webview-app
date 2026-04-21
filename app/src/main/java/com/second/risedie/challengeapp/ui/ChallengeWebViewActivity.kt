@@ -107,7 +107,6 @@ class ChallengeWebViewActivity : ComponentActivity() {
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             cacheMode = WebSettings.LOAD_NO_CACHE
-            setAppCacheEnabled(false)
             builtInZoomControls = false
             displayZoomControls = false
             loadsImagesAutomatically = true

@@ -11,7 +11,6 @@ import android.webkit.JavascriptInterface
 import androidx.activity.ComponentActivity
 import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.HealthConnectClient
-import com.second.risedie.challengeapp.BuildConfig
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
@@ -423,8 +422,7 @@ class ChallengeAppBridge(
             )
         ).records.sumOf { session ->
             when (session.exerciseType) {
-                ExerciseSessionRecord.EXERCISE_TYPE_RUNNING,
-                ExerciseSessionRecord.EXERCISE_TYPE_TREADMILL_RUNNING -> session.totalDistance?.inMeters ?: 0.0
+                ExerciseSessionRecord.EXERCISE_TYPE_RUNNING -> sumDistanceMetersForSession(client, session)
                 else -> 0.0
             }
         }
@@ -475,10 +473,30 @@ class ChallengeAppBridge(
             .put("generated_at", now.toString())
             .toString()
 
-        logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
-        emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
+        logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to runningDistanceMeters, "batchesCount" to batches.length(), "payload" to payload))
+        emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to runningDistanceMeters, "batchesCount" to batches.length(), "payload" to payload))
 
         return payload
+    }
+
+
+    private suspend fun sumDistanceMetersForSession(
+        client: HealthConnectClient,
+        session: ExerciseSessionRecord,
+    ): Double {
+        return try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = DistanceRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(session.startTime, session.endTime),
+                )
+            ).records.sumOf { distanceRecord ->
+                distanceRecord.distance.inMeters
+            }
+        } catch (error: Throwable) {
+            logError("sync:running_distance_for_session:error", error)
+            0.0
+        }
     }
 
 
