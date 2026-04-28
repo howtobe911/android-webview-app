@@ -3,6 +3,10 @@ package com.second.risedie.challengeapp.bridge
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -29,12 +33,16 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.time.ZoneId
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.math.max
 
 
 class ChallengeAppBridge(
@@ -112,6 +120,10 @@ class ChallengeAppBridge(
             .put("activity_recognition_granted", isActivityRecognitionGranted())
             .put("app_version", BuildConfig.VERSION_NAME)
             .put("app_version_code", BuildConfig.VERSION_CODE)
+            .put("preferred_source", if (status == HealthConnectClient.SDK_AVAILABLE) "health_connect" else "device_step_counter")
+            .put("manufacturer", Build.MANUFACTURER)
+            .put("model", Build.MODEL)
+            .put("known_health_apps", knownHealthApps())
             .toString()
     }
 
@@ -136,7 +148,12 @@ class ChallengeAppBridge(
 
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
-            val payload = unavailablePayload(status)
+            val payload = permissionPayload(
+                available = hasStepCounterSensor(),
+                granted = hasStepCounterSensor(),
+                pending = false,
+                message = if (hasStepCounterSensor()) "Health Connect недоступен. Используем аппаратный счётчик шагов телефона как резервный источник." else unavailableMessage(status),
+            )
             cachedPermissionPayload = payload
             logDebug("permissions:request:sdk_unavailable", mapOf("payload" to payload))
             emitDebugEvent("permissions:request:sdk_unavailable", mapOf("payload" to payload))
@@ -372,10 +389,7 @@ class ChallengeAppBridge(
             emitDebugEvent("sync:read:start", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
             val status = sdkStatus()
             when {
-                status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
-                    .put("batches", JSONArray())
-                    .put("message", unavailableMessage(status))
-                    .toString()
+                status != HealthConnectClient.SDK_AVAILABLE -> buildDeviceStepCounterPayload(status)
 
                 healthClient == null -> JSONObject()
                     .put("batches", JSONArray())
@@ -412,6 +426,168 @@ class ChallengeAppBridge(
     }
 
 
+
+    private fun knownHealthApps(): JSONArray {
+        val packages = listOf(
+            "com.google.android.apps.healthdata" to "Health Connect",
+            "com.sec.android.app.shealth" to "Samsung Health",
+            "com.huawei.health" to "Huawei Health",
+            "com.hihonor.health" to "Honor Health",
+            "com.xiaomi.wearable" to "Mi Fitness",
+            "com.xiaomi.hm.health" to "Zepp Life",
+            "com.huami.watch.hmwatchmanager" to "Zepp"
+        )
+        val array = JSONArray()
+        for ((packageName, label) in packages) {
+            array.put(JSONObject().put("package", packageName).put("label", label).put("installed", isPackageInstalled(packageName)))
+        }
+        return array
+    }
+
+    private fun isPackageInstalled(packageName: String): Boolean {
+        return try {
+            context.packageManager.getPackageInfo(packageName, 0)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun hasStepCounterSensor(): Boolean {
+        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager ?: return false
+        return sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) != null
+    }
+
+    private suspend fun buildDeviceStepCounterPayload(status: Int): String {
+        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+        val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+        val now = Instant.now()
+        val zoneId = ZoneId.systemDefault()
+        val startOfDay = now.atZone(zoneId).toLocalDate().atStartOfDay(zoneId).toInstant()
+
+        if (sensor == null) {
+            return JSONObject()
+                .put("batches", JSONArray())
+                .put("preferred_source", "device_step_counter")
+                .put("message", unavailableMessage(status))
+                .toString()
+        }
+
+        if (!isActivityRecognitionGranted()) {
+            return JSONObject()
+                .put("batches", JSONArray())
+                .put("generated_at", now.toString())
+                .put("preferred_source", "device_step_counter")
+                .put("provider", providerPayload("device_step_counter", "Android Device Step Counter", 40, 55))
+                .put("message", "Для чтения аппаратного счётчика шагов нужно разрешение ACTIVITY_RECOGNITION.")
+                .toString()
+        }
+
+        val rawCounter = readStepCounterSnapshot(sensorManager, sensor)
+        if (rawCounter == null) {
+            return JSONObject()
+                .put("batches", JSONArray())
+                .put("generated_at", now.toString())
+                .put("preferred_source", "device_step_counter")
+                .put("provider", providerPayload("device_step_counter", "Android Device Step Counter", 40, 55))
+                .put("message", "Не удалось получить live-снимок аппаратного счётчика шагов.")
+                .toString()
+        }
+
+        val dayKey = now.atZone(zoneId).toLocalDate().toString()
+        val prefs = context.getSharedPreferences(STEP_COUNTER_PREFS, Context.MODE_PRIVATE)
+        val baselineKey = "baseline_$dayKey"
+        val lastRawKey = "last_raw"
+        val lastDayKey = "last_day"
+
+        val previousRaw = prefs.getFloat(lastRawKey, rawCounter)
+        val storedDay = prefs.getString(lastDayKey, null)
+        val baseline = if (storedDay != dayKey || !prefs.contains(baselineKey) || rawCounter < previousRaw) {
+            rawCounter
+        } else {
+            prefs.getFloat(baselineKey, rawCounter)
+        }
+
+        prefs.edit()
+            .putString(lastDayKey, dayKey)
+            .putFloat(baselineKey, baseline)
+            .putFloat(lastRawKey, rawCounter)
+            .apply()
+
+        val stepsToday = max(0f, rawCounter - baseline).toLong()
+        val batches = JSONArray()
+        if (stepsToday > 0L) {
+            batches.put(
+                JSONObject()
+                    .put("kind", "walk_steps")
+                    .put("external_batch_id", "device-step-counter-${startOfDay.epochSecond}")
+                    .put(
+                        "records",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("activity_type", "walk")
+                                .put("metric_type", "steps")
+                                .put("value", stepsToday)
+                                .put("recorded_from", startOfDay.toString())
+                                .put("recorded_to", now.toString())
+                                .put("source_hash", "device-step-counter-${startOfDay.epochSecond}-$stepsToday")
+                        )
+                    )
+            )
+        }
+
+        return JSONObject()
+            .put("batches", batches)
+            .put("generated_at", now.toString())
+            .put("preferred_source", "device_step_counter")
+            .put("provider", providerPayload("device_step_counter", "Android Device Step Counter", 40, 55))
+            .put("raw_counter_since_boot", rawCounter.toDouble())
+            .put("baseline_counter", baseline.toDouble())
+            .put("message", if (stepsToday > 0L) "Шаги получены из аппаратного счётчика телефона." else "Счётчик доступен, дневной baseline создан. Следующие шаги начнут учитываться после движения.")
+            .toString()
+    }
+
+    private suspend fun readStepCounterSnapshot(sensorManager: SensorManager, sensor: Sensor): Float? {
+        return withContext(Dispatchers.Main.immediate) {
+            withTimeoutOrNull(3_000) {
+                suspendCancellableCoroutine { continuation ->
+                    val listener = object : SensorEventListener {
+                        override fun onSensorChanged(event: SensorEvent) {
+                            val value = event.values.firstOrNull()
+                            if (value != null && continuation.isActive) {
+                                sensorManager.unregisterListener(this)
+                                continuation.resume(value)
+                            }
+                        }
+
+                        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+                    }
+
+                    val registered = sensorManager.registerListener(
+                        listener,
+                        sensor,
+                        SensorManager.SENSOR_DELAY_NORMAL,
+                    )
+
+                    if (!registered && continuation.isActive) {
+                        continuation.resume(null)
+                    }
+
+                    continuation.invokeOnCancellation {
+                        sensorManager.unregisterListener(listener)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun providerPayload(type: String, name: String, priority: Int, confidenceScore: Int): JSONObject {
+        return JSONObject()
+            .put("type", type)
+            .put("name", name)
+            .put("priority", priority)
+            .put("confidence_score", confidenceScore)
+    }
 
     private suspend fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
         return try {
@@ -488,6 +664,8 @@ class ChallengeAppBridge(
         val payload = JSONObject()
             .put("batches", batches)
             .put("generated_at", now.toString())
+            .put("preferred_source", "health_connect")
+            .put("provider", JSONObject().put("type", "health_connect").put("name", "Health Connect").put("priority", 80).put("confidence_score", 88))
             .toString()
 
         logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
@@ -589,6 +767,7 @@ class ChallengeAppBridge(
 
     companion object {
         private const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"
+        private const val STEP_COUNTER_PREFS = "grafit_device_step_counter"
         private const val LOG_TAG = "GrafitActivitySync"
     }
 }

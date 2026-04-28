@@ -8,6 +8,12 @@
 
     <queries>
         <package android:name="com.google.android.apps.healthdata" />
+        <package android:name="com.sec.android.app.shealth" />
+        <package android:name="com.huawei.health" />
+        <package android:name="com.hihonor.health" />
+        <package android:name="com.xiaomi.wearable" />
+        <package android:name="com.xiaomi.hm.health" />
+        <package android:name="com.huami.watch.hmwatchmanager" />
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="https" />
