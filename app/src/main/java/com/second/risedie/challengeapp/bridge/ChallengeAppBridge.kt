@@ -304,7 +304,7 @@ class ChallengeAppBridge(
     fun getLiveActivitySnapshot(): String {
         return try {
             runBlocking {
-                buildDeviceStepCounterPayload(sdkStatus())
+                buildDeviceStepCounterPayload(sdkStatus(), includeServerBatch = false, liveUiOnly = true)
             }
         } catch (error: Throwable) {
             logError("live_ui:read:error", error)
@@ -437,32 +437,65 @@ class ChallengeAppBridge(
             emitDebugEvent("sync:read:start", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
             val status = sdkStatus()
             when {
-                status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
-                    .put("batches", JSONArray())
-                    .put("preferred_source", "health_connect")
-                    .put("message", unavailableMessage(status))
-                    .toString()
+                status != HealthConnectClient.SDK_AVAILABLE -> buildDeviceStepCounterPayload(
+                    status = status,
+                    includeServerBatch = true,
+                    liveUiOnly = false,
+                    fallbackMessage = unavailableMessage(status),
+                )
 
-                healthClient == null -> JSONObject()
-                    .put("batches", JSONArray())
-                    .put("message", "Health Connect не инициализировался.")
-                    .toString()
+                healthClient == null -> buildDeviceStepCounterPayload(
+                    status = status,
+                    includeServerBatch = true,
+                    liveUiOnly = false,
+                    fallbackMessage = "Health Connect не инициализировался. Используем аппаратный счётчик шагов.",
+                )
 
                 else -> {
                     val client = healthClient!!
                     val granted = safeGrantedPermissions(client)
                     if (!granted.containsAll(permissions)) {
-                        JSONObject()
-                            .put("batches", JSONArray())
-                            .put("message", "Разрешения на шаги и дистанцию ещё не выданы.")
-                            .toString()
+                        buildDeviceStepCounterPayload(
+                            status = status,
+                            includeServerBatch = true,
+                            liveUiOnly = false,
+                            fallbackMessage = "Разрешения Health Connect не выданы полностью. Используем аппаратный счётчик шагов.",
+                        )
                     } else {
-                        withTimeout(10_000) {
-                            readMutex.withLock {
-                                withContext(Dispatchers.IO) {
-                                    buildActivityPayload(client)
+                        val healthConnectPayload = try {
+                            withTimeout(10_000) {
+                                readMutex.withLock {
+                                    withContext(Dispatchers.IO) {
+                                        buildActivityPayload(client)
+                                    }
                                 }
                             }
+                        } catch (error: Throwable) {
+                            logError("sync:read:health_connect_failed_fallback_to_step_counter", error)
+                            emitDebugEvent("sync:read:health_connect_failed_fallback", mapOf("message" to (error.message ?: "unknown")))
+                            return buildDeviceStepCounterPayload(
+                                status = status,
+                                includeServerBatch = true,
+                                liveUiOnly = false,
+                                fallbackMessage = error.message ?: "Health Connect не вернул данные. Используем аппаратный счётчик шагов.",
+                            )
+                        }
+
+                        val batchesCount = try {
+                            JSONObject(healthConnectPayload).optJSONArray("batches")?.length() ?: 0
+                        } catch (_: Throwable) {
+                            0
+                        }
+
+                        if (batchesCount > 0) {
+                            healthConnectPayload
+                        } else {
+                            buildDeviceStepCounterPayload(
+                                status = status,
+                                includeServerBatch = true,
+                                liveUiOnly = false,
+                                fallbackMessage = "Health Connect вернул 0 записей. Используем аппаратный счётчик шагов.",
+                            )
                         }
                     }
                 }
@@ -470,10 +503,12 @@ class ChallengeAppBridge(
         } catch (error: Throwable) {
             logError("sync:read:error", error)
             emitDebugEvent("sync:read:error", mapOf("message" to (error.message ?: "unknown")))
-            JSONObject()
-                .put("batches", JSONArray())
-                .put("message", error.message ?: "Не удалось прочитать данные из Health Connect.")
-                .toString()
+            buildDeviceStepCounterPayload(
+                status = sdkStatus(),
+                includeServerBatch = true,
+                liveUiOnly = false,
+                fallbackMessage = error.message ?: "Не удалось прочитать данные из Health Connect. Используем аппаратный счётчик шагов.",
+            )
         }
     }
 
@@ -513,7 +548,12 @@ class ChallengeAppBridge(
         return sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) != null
     }
 
-    private suspend fun buildDeviceStepCounterPayload(status: Int): String {
+    private suspend fun buildDeviceStepCounterPayload(
+        status: Int,
+        includeServerBatch: Boolean = false,
+        liveUiOnly: Boolean = true,
+        fallbackMessage: String? = null,
+    ): String {
         val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         val now = Instant.now()
@@ -570,18 +610,44 @@ class ChallengeAppBridge(
             .apply()
 
         val stepsToday = max(0f, rawCounter - baseline).toLong()
-        return JSONObject()
-            .put("batches", JSONArray())
+        val batches = JSONArray()
+        if (includeServerBatch && stepsToday > 0L) {
+            batches.put(
+                JSONObject()
+                    .put("kind", "walk_steps")
+                    .put("external_batch_id", "device-step-counter-${startOfDay.epochSecond}")
+                    .put(
+                        "records",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("activity_type", "walk")
+                                .put("metric_type", "steps")
+                                .put("value", stepsToday)
+                                .put("recorded_from", startOfDay.toString())
+                                .put("recorded_to", now.toString())
+                                .put("source_hash", "device-step-counter-${startOfDay.epochSecond}-$stepsToday")
+                        )
+                    )
+            )
+        }
+
+        val payload = JSONObject()
+            .put("batches", batches)
             .put("generated_at", now.toString())
-            .put("preferred_source", "live_device_step_counter")
-            .put("provider", providerPayload("live_device_step_counter", "Android Live Step Counter", 0, 0))
-            .put("is_live_ui_only", true)
+            .put("source_day", dayKey)
+            .put("preferred_source", if (liveUiOnly) "live_device_step_counter" else "device_step_counter")
+            .put("provider", providerPayload(if (liveUiOnly) "live_device_step_counter" else "device_step_counter", if (liveUiOnly) "Android Live Step Counter" else "Android Device Step Counter", if (liveUiOnly) 0 else 40, if (liveUiOnly) 0 else 55))
             .put("available", true)
             .put("steps_today", stepsToday)
             .put("raw_counter_since_boot", rawCounter.toDouble())
             .put("baseline_counter", baseline.toDouble())
-            .put("message", if (stepsToday > 0L) "Live-шаги получены из аппаратного счётчика телефона только для UI." else "Live-счётчик доступен, дневной baseline создан.")
-            .toString()
+            .put("message", fallbackMessage ?: if (stepsToday > 0L) "Шаги получены из аппаратного счётчика телефона." else "Live-счётчик доступен, дневной baseline создан.")
+
+        if (liveUiOnly) {
+            payload.put("is_live_ui_only", true)
+        }
+
+        return payload.toString()
     }
 
     private suspend fun readStepCounterSnapshot(sensorManager: SensorManager, sensor: Sensor): Float? {
@@ -648,14 +714,29 @@ class ChallengeAppBridge(
         val now = Instant.now()
         val startOfDay = now.atZone(zoneId).toLocalDate().atStartOfDay(zoneId).toInstant()
 
-        val stepsTotal = client.aggregate(
-            AggregateRequest(
-                metrics = setOf(StepsRecord.COUNT_TOTAL),
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
-            )
-        )[StepsRecord.COUNT_TOTAL] ?: 0L
+        val healthConnectWarnings = JSONArray()
+        val stepsTotal = try {
+            client.aggregate(
+                AggregateRequest(
+                    metrics = setOf(StepsRecord.COUNT_TOTAL),
+                    timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
+                )
+            )[StepsRecord.COUNT_TOTAL] ?: 0L
+        } catch (error: Throwable) {
+            logError("sync:build_payload:steps_failed", error)
+            emitDebugEvent("sync:build_payload:steps_failed", mapOf("message" to (error.message ?: "unknown")))
+            healthConnectWarnings.put("steps: ${error.message ?: error.javaClass.simpleName}")
+            0L
+        }
 
-        val distanceMeters = calculateRunningDistanceMeters(client, startOfDay, now)
+        val distanceMeters = try {
+            calculateRunningDistanceMeters(client, startOfDay, now)
+        } catch (error: Throwable) {
+            logError("sync:build_payload:distance_failed", error)
+            emitDebugEvent("sync:build_payload:distance_failed", mapOf("message" to (error.message ?: "unknown")))
+            healthConnectWarnings.put("distance: ${error.message ?: error.javaClass.simpleName}")
+            0.0
+        }
 
         val batches = JSONArray()
         if (stepsTotal > 0L) {
@@ -698,12 +779,18 @@ class ChallengeAppBridge(
             )
         }
 
-        val payload = JSONObject()
+        val payloadJson = JSONObject()
             .put("batches", batches)
             .put("generated_at", now.toString())
+            .put("source_day", now.atZone(zoneId).toLocalDate().toString())
             .put("preferred_source", "health_connect")
             .put("provider", JSONObject().put("type", "health_connect").put("name", "Health Connect").put("priority", 80).put("confidence_score", 88))
-            .toString()
+
+        if (healthConnectWarnings.length() > 0) {
+            payloadJson.put("warnings", healthConnectWarnings)
+        }
+
+        val payload = payloadJson.toString()
 
         logDebug("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
         emitDebugEvent("sync:build_payload:result", mapOf("stepsTotal" to stepsTotal, "distanceMeters" to distanceMeters, "batchesCount" to batches.length(), "payload" to payload))
