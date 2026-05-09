@@ -120,11 +120,17 @@ class ChallengeAppBridge(
             .put("activity_recognition_granted", isActivityRecognitionGranted())
             .put("app_version", BuildConfig.VERSION_NAME)
             .put("app_version_code", BuildConfig.VERSION_CODE)
-            .put("preferred_source", if (status == HealthConnectClient.SDK_AVAILABLE) "health_connect" else "device_step_counter")
+            .put("preferred_source", "health_connect")
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .put("known_health_apps", knownHealthApps())
             .toString()
+    }
+
+    @JavascriptInterface
+    fun getPermissionState(): String {
+        refreshPermissionState(notifyJavascript = false, refreshActivity = false)
+        return cachedPermissionPayload
     }
 
     @JavascriptInterface
@@ -148,12 +154,7 @@ class ChallengeAppBridge(
 
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
-            val payload = permissionPayload(
-                available = hasStepCounterSensor(),
-                granted = hasStepCounterSensor(),
-                pending = false,
-                message = if (hasStepCounterSensor()) "Health Connect недоступен. Используем аппаратный счётчик шагов телефона как резервный источник." else unavailableMessage(status),
-            )
+            val payload = unavailablePayload(status)
             cachedPermissionPayload = payload
             logDebug("permissions:request:sdk_unavailable", mapOf("payload" to payload))
             emitDebugEvent("permissions:request:sdk_unavailable", mapOf("payload" to payload))
@@ -299,6 +300,53 @@ class ChallengeAppBridge(
         return JSONObject().put("opened", false).toString()
     }
 
+    @JavascriptInterface
+    fun getLiveActivitySnapshot(): String {
+        return try {
+            runBlocking {
+                buildDeviceStepCounterPayload(sdkStatus())
+            }
+        } catch (error: Throwable) {
+            logError("live_ui:read:error", error)
+            JSONObject()
+                .put("is_live_ui_only", true)
+                .put("available", false)
+                .put("message", error.message ?: "Не удалось получить live-шаги.")
+                .toString()
+        }
+    }
+
+    @JavascriptInterface
+    fun openKnownHealthApp(packageName: String): String {
+        val allowedPackages = knownHealthAppPackages().map { it.first }.toSet()
+        if (!allowedPackages.contains(packageName)) {
+            return JSONObject()
+                .put("opened", false)
+                .put("message", "Неизвестное приложение здоровья.")
+                .toString()
+        }
+
+        return try {
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
+            if (launchIntent != null) {
+                activity.startActivity(launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                JSONObject().put("opened", true).toString()
+            } else {
+                activity.startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.parse("package:$packageName"))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+                JSONObject().put("opened", true).toString()
+            }
+        } catch (_: Throwable) {
+            JSONObject()
+                .put("opened", false)
+                .put("message", "Не удалось открыть приложение.")
+                .toString()
+        }
+    }
+
     private fun refreshPermissionState(
         notifyJavascript: Boolean,
         refreshActivity: Boolean,
@@ -389,7 +437,11 @@ class ChallengeAppBridge(
             emitDebugEvent("sync:read:start", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
             val status = sdkStatus()
             when {
-                status != HealthConnectClient.SDK_AVAILABLE -> buildDeviceStepCounterPayload(status)
+                status != HealthConnectClient.SDK_AVAILABLE -> JSONObject()
+                    .put("batches", JSONArray())
+                    .put("preferred_source", "health_connect")
+                    .put("message", unavailableMessage(status))
+                    .toString()
 
                 healthClient == null -> JSONObject()
                     .put("batches", JSONArray())
@@ -427,8 +479,8 @@ class ChallengeAppBridge(
 
 
 
-    private fun knownHealthApps(): JSONArray {
-        val packages = listOf(
+    private fun knownHealthAppPackages(): List<Pair<String, String>> {
+        return listOf(
             "com.google.android.apps.healthdata" to "Health Connect",
             "com.sec.android.app.shealth" to "Samsung Health",
             "com.huawei.health" to "Huawei Health",
@@ -437,8 +489,11 @@ class ChallengeAppBridge(
             "com.xiaomi.hm.health" to "Zepp Life",
             "com.huami.watch.hmwatchmanager" to "Zepp"
         )
+    }
+
+    private fun knownHealthApps(): JSONArray {
         val array = JSONArray()
-        for ((packageName, label) in packages) {
+        for ((packageName, label) in knownHealthAppPackages()) {
             array.put(JSONObject().put("package", packageName).put("label", label).put("installed", isPackageInstalled(packageName)))
         }
         return array
@@ -515,35 +570,17 @@ class ChallengeAppBridge(
             .apply()
 
         val stepsToday = max(0f, rawCounter - baseline).toLong()
-        val batches = JSONArray()
-        if (stepsToday > 0L) {
-            batches.put(
-                JSONObject()
-                    .put("kind", "walk_steps")
-                    .put("external_batch_id", "device-step-counter-${startOfDay.epochSecond}")
-                    .put(
-                        "records",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("activity_type", "walk")
-                                .put("metric_type", "steps")
-                                .put("value", stepsToday)
-                                .put("recorded_from", startOfDay.toString())
-                                .put("recorded_to", now.toString())
-                                .put("source_hash", "device-step-counter-${startOfDay.epochSecond}-$stepsToday")
-                        )
-                    )
-            )
-        }
-
         return JSONObject()
-            .put("batches", batches)
+            .put("batches", JSONArray())
             .put("generated_at", now.toString())
-            .put("preferred_source", "device_step_counter")
-            .put("provider", providerPayload("device_step_counter", "Android Device Step Counter", 40, 55))
+            .put("preferred_source", "live_device_step_counter")
+            .put("provider", providerPayload("live_device_step_counter", "Android Live Step Counter", 0, 0))
+            .put("is_live_ui_only", true)
+            .put("available", true)
+            .put("steps_today", stepsToday)
             .put("raw_counter_since_boot", rawCounter.toDouble())
             .put("baseline_counter", baseline.toDouble())
-            .put("message", if (stepsToday > 0L) "Шаги получены из аппаратного счётчика телефона." else "Счётчик доступен, дневной baseline создан. Следующие шаги начнут учитываться после движения.")
+            .put("message", if (stepsToday > 0L) "Live-шаги получены из аппаратного счётчика телефона только для UI." else "Live-счётчик доступен, дневной baseline создан.")
             .toString()
     }
 
@@ -731,6 +768,12 @@ class ChallengeAppBridge(
             .put("granted", granted)
             .put("pending", pending)
             .put("message", message)
+            .put("physical_activity_granted", isActivityRecognitionGranted())
+            .put("health_connect_granted", granted)
+            .put("health_connect_available", sdkStatus() == HealthConnectClient.SDK_AVAILABLE)
+            .put("known_health_apps", knownHealthApps())
+            .put("manufacturer", Build.MANUFACTURER)
+            .put("model", Build.MODEL)
             .toString()
     }
 
