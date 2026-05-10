@@ -52,6 +52,7 @@ class HealthConnectRepository(private val context: Context) {
         if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
 
         val zoneId = ZoneId.systemDefault()
+        val timezone = zoneId.id
         val now = Instant.now()
         val day = now.atZone(zoneId).toLocalDate()
         val startOfDay = day.atStartOfDay(zoneId).toInstant()
@@ -82,6 +83,10 @@ class HealthConnectRepository(private val context: Context) {
                 JSONObject()
                     .put("kind", "walk_steps")
                     .put("external_batch_id", "health-connect-steps-${startOfDay.epochSecond}")
+                    .put("generated_at", now.toString())
+                    .put("device_time", now.toString())
+                    .put("source_day", day.toString())
+                    .put("timezone", timezone)
                     .put(
                         "records",
                         JSONArray().put(
@@ -91,6 +96,10 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("value", stepsTotal)
                                 .put("recorded_from", startOfDay.toString())
                                 .put("recorded_to", now.toString())
+                                .put("client_generated_at", now.toString())
+                                .put("device_time", now.toString())
+                                .put("source_day", day.toString())
+                                .put("client_timezone", timezone)
                                 .put("source_hash", "health-connect-steps-${startOfDay.epochSecond}-$stepsTotal")
                         )
                     )
@@ -103,6 +112,10 @@ class HealthConnectRepository(private val context: Context) {
                 JSONObject()
                     .put("kind", "run_distance")
                     .put("external_batch_id", "health-connect-distance-${startOfDay.epochSecond}")
+                    .put("generated_at", now.toString())
+                    .put("device_time", now.toString())
+                    .put("source_day", day.toString())
+                    .put("timezone", timezone)
                     .put(
                         "records",
                         JSONArray().put(
@@ -112,6 +125,10 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("value", normalizedDistance)
                                 .put("recorded_from", startOfDay.toString())
                                 .put("recorded_to", now.toString())
+                                .put("client_generated_at", now.toString())
+                                .put("device_time", now.toString())
+                                .put("source_day", day.toString())
+                                .put("client_timezone", timezone)
                                 .put("source_hash", "health-connect-distance-${startOfDay.epochSecond}-$normalizedDistance")
                         )
                     )
@@ -122,6 +139,8 @@ class HealthConnectRepository(private val context: Context) {
             .put("batches", batches)
             .put("generated_at", now.toString())
             .put("source_day", day.toString())
+            .put("timezone", timezone)
+            .put("device_time", now.toString())
             .put("preferred_source", "health_connect")
             .put("provider", providerPayload())
             .apply {

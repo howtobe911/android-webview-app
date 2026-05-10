@@ -43,6 +43,10 @@ class HealthSyncWorker(
                     .put("source_id", sourceId)
                     .put("kind", batch.optString("kind"))
                     .put("external_batch_id", batch.optString("external_batch_id"))
+                    .put("generated_at", batch.optString("generated_at", payload.optString("generated_at")))
+                    .put("device_time", batch.optString("device_time", payload.optString("device_time")))
+                    .put("source_day", batch.optString("source_day", payload.optString("source_day")))
+                    .put("timezone", batch.optString("timezone", payload.optString("timezone")))
                     .put("records", batch.optJSONArray("records"))
                 postJson("$apiBase/api/v1/me/sources/sync", token, body)
             }
