@@ -13,7 +13,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.util.Locale
 
@@ -78,6 +80,9 @@ class HealthConnectRepository(private val context: Context) {
         }
 
         val batches = JSONArray()
+
+
+        buildActivityWindowsBatch(client, day.minusDays(1), zoneId, now)?.let { batches.put(it) }
         if (stepsTotal > 0L) {
             batches.put(
                 JSONObject()
@@ -154,6 +159,120 @@ class HealthConnectRepository(private val context: Context) {
         .put("preferred_source", "health_connect")
         .put("provider", providerPayload())
         .put("message", message)
+
+    private suspend fun buildActivityWindowsBatch(
+        client: HealthConnectClient,
+        sourceDay: LocalDate,
+        zoneId: ZoneId,
+        generatedAt: Instant,
+    ): JSONObject? {
+        val startOfDay = sourceDay.atStartOfDay(zoneId).toInstant()
+        val endOfDay = sourceDay.plusDays(1).atStartOfDay(zoneId).toInstant()
+        if (!endOfDay.isBefore(generatedAt)) return null
+
+        val windows = JSONArray()
+        var windowStart = startOfDay
+        val runningSessions = try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = ExerciseSessionRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(startOfDay, endOfDay),
+                )
+            ).records.filter { it.exerciseType == ExerciseSessionRecord.EXERCISE_TYPE_RUNNING }
+        } catch (_: Throwable) {
+            emptyList()
+        }
+
+        while (windowStart.isBefore(endOfDay)) {
+            val windowEnd = windowStart.plus(Duration.ofMinutes(15)).let { if (it.isAfter(endOfDay)) endOfDay else it }
+            val steps = try {
+                client.aggregate(
+                    AggregateRequest(
+                        metrics = setOf(StepsRecord.COUNT_TOTAL),
+                        timeRangeFilter = TimeRangeFilter.between(windowStart, windowEnd),
+                    )
+                )[StepsRecord.COUNT_TOTAL] ?: 0L
+            } catch (_: Throwable) {
+                0L
+            }
+
+            if (steps > 0L) {
+                windows.put(
+                    JSONObject()
+                        .put("activity_type", "walk")
+                        .put("metric_type", "steps_window")
+                        .put("value", steps)
+                        .put("recorded_from", windowStart.toString())
+                        .put("recorded_to", windowEnd.toString())
+                        .put("source_day", sourceDay.toString())
+                        .put("source_hash", "health-connect-steps-window-${sourceDay}-${windowStart.epochSecond}-$steps")
+                )
+            }
+
+            var runDistanceMeters = 0.0
+            var runDurationSeconds = 0L
+            for (session in runningSessions) {
+                val from = maxInstant(windowStart, session.startTime)
+                val to = minInstant(windowEnd, session.endTime)
+                if (!to.isAfter(from)) continue
+                runDurationSeconds += Duration.between(from, to).seconds
+                runDistanceMeters += try {
+                    client.aggregate(
+                        AggregateRequest(
+                            metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+                            timeRangeFilter = TimeRangeFilter.between(from, to),
+                        )
+                    )[DistanceRecord.DISTANCE_TOTAL]?.inMeters ?: 0.0
+                } catch (_: Throwable) {
+                    0.0
+                }
+            }
+
+            if (runDistanceMeters > 0.0) {
+                val normalized = String.format(Locale.US, "%.2f", runDistanceMeters).toDouble()
+                windows.put(
+                    JSONObject()
+                        .put("activity_type", "run")
+                        .put("metric_type", "run_distance_window")
+                        .put("value", normalized)
+                        .put("recorded_from", windowStart.toString())
+                        .put("recorded_to", windowEnd.toString())
+                        .put("source_day", sourceDay.toString())
+                        .put("source_hash", "health-connect-run-distance-window-${sourceDay}-${windowStart.epochSecond}-$normalized")
+                )
+            }
+
+            if (runDurationSeconds > 0L) {
+                windows.put(
+                    JSONObject()
+                        .put("activity_type", "run")
+                        .put("metric_type", "run_duration_window")
+                        .put("value", runDurationSeconds)
+                        .put("recorded_from", windowStart.toString())
+                        .put("recorded_to", windowEnd.toString())
+                        .put("source_day", sourceDay.toString())
+                        .put("source_hash", "health-connect-run-duration-window-${sourceDay}-${windowStart.epochSecond}-$runDurationSeconds")
+                )
+            }
+
+            windowStart = windowEnd
+        }
+
+        if (windows.length() == 0) return null
+        return JSONObject()
+            .put("kind", "activity_windows")
+            .put("external_batch_id", "health-connect-activity-windows-${sourceDay}")
+            .put("generated_at", generatedAt.toString())
+            .put("device_time", generatedAt.toString())
+            .put("source_day", sourceDay.toString())
+            .put("timezone", zoneId.id)
+            .put("window_size_minutes", 15)
+            .put("records", windows)
+    }
+
+    private fun minInstant(a: Instant, b: Instant): Instant = if (a.isBefore(b)) a else b
+
+    private fun maxInstant(a: Instant, b: Instant): Instant = if (a.isAfter(b)) a else b
 
     private suspend fun calculateRunningDistanceMeters(
         client: HealthConnectClient,
