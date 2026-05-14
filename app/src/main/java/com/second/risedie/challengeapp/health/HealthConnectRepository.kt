@@ -60,17 +60,7 @@ class HealthConnectRepository(private val context: Context) {
         val startOfDay = day.atStartOfDay(zoneId).toInstant()
         val warnings = JSONArray()
 
-        val stepsTotal = try {
-            client.aggregate(
-                AggregateRequest(
-                    metrics = setOf(StepsRecord.COUNT_TOTAL),
-                    timeRangeFilter = TimeRangeFilter.between(startOfDay, now),
-                )
-            )[StepsRecord.COUNT_TOTAL] ?: 0L
-        } catch (error: Throwable) {
-            warnings.put("steps: ${error.message ?: error.javaClass.simpleName}")
-            0L
-        }
+        val stepsTotal = readStepsTotal(client, startOfDay, now, warnings)
 
         val distanceMeters = try {
             calculateRunningDistanceMeters(client, startOfDay, now)
@@ -159,6 +149,43 @@ class HealthConnectRepository(private val context: Context) {
         .put("preferred_source", "health_connect")
         .put("provider", providerPayload())
         .put("message", message)
+
+    private suspend fun readStepsTotal(
+        client: HealthConnectClient,
+        from: Instant,
+        to: Instant,
+        warnings: JSONArray,
+    ): Long {
+        val aggregateTotal = try {
+            client.aggregate(
+                AggregateRequest(
+                    metrics = setOf(StepsRecord.COUNT_TOTAL),
+                    timeRangeFilter = TimeRangeFilter.between(from, to),
+                )
+            )[StepsRecord.COUNT_TOTAL] ?: 0L
+        } catch (error: Throwable) {
+            warnings.put("steps_aggregate: ${error.message ?: error.javaClass.simpleName}")
+            0L
+        }
+
+        if (aggregateTotal > 0L) return aggregateTotal
+
+        return try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = StepsRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(from, to),
+                )
+            ).records.sumOf { record ->
+                val overlapStart = maxInstant(from, record.startTime)
+                val overlapEnd = minInstant(to, record.endTime)
+                if (!overlapEnd.isAfter(overlapStart)) 0L else record.count
+            }
+        } catch (error: Throwable) {
+            warnings.put("steps_records: ${error.message ?: error.javaClass.simpleName}")
+            0L
+        }
+    }
 
     private suspend fun buildActivityWindowsBatch(
         client: HealthConnectClient,

@@ -110,6 +110,7 @@ class ChallengeAppBridge(
             .put("source_id", normalizedSourceId)
             .put("periodic_minutes", 15)
             .put("foreground_minutes", 5)
+            .put("immediate_sync_queued", true)
             .toString()
     }
 
