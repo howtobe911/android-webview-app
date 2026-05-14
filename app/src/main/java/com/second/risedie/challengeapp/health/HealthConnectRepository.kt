@@ -49,7 +49,7 @@ class HealthConnectRepository(private val context: Context) {
 
     suspend fun hasPermissions(): Boolean = grantedPermissions().containsAll(permissions)
 
-    suspend fun buildSyncPayload(): JSONObject = withContext(Dispatchers.IO) {
+    suspend fun buildSyncPayload(includeClosedDayWindows: Boolean = true, includeRunDistance: Boolean = true): JSONObject = withContext(Dispatchers.IO) {
         val client = clientOrNull() ?: return@withContext emptyPayload("Health Connect недоступен.")
         if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
 
@@ -62,17 +62,23 @@ class HealthConnectRepository(private val context: Context) {
 
         val stepsTotal = readStepsTotal(client, startOfDay, now, warnings)
 
-        val distanceMeters = try {
-            calculateRunningDistanceMeters(client, startOfDay, now)
-        } catch (error: Throwable) {
-            warnings.put("distance: ${error.message ?: error.javaClass.simpleName}")
+        val distanceMeters = if (includeRunDistance) {
+            try {
+                calculateRunningDistanceMeters(client, startOfDay, now)
+            } catch (error: Throwable) {
+                warnings.put("distance: ${error.message ?: error.javaClass.simpleName}")
+                0.0
+            }
+        } else {
             0.0
         }
 
         val batches = JSONArray()
 
 
-        buildActivityWindowsBatch(client, day.minusDays(1), zoneId, now)?.let { batches.put(it) }
+        if (includeClosedDayWindows) {
+            buildActivityWindowsBatch(client, day.minusDays(1), zoneId, now)?.let { batches.put(it) }
+        }
         if (stepsTotal > 0L) {
             batches.put(
                 JSONObject()

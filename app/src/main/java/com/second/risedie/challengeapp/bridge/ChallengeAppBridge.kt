@@ -253,7 +253,7 @@ class ChallengeAppBridge(
     fun getActivitySyncPayload(): String {
         return runBlocking {
             try {
-                val payload = withTimeout(10_000) { healthRepository.buildSyncPayload() }
+                val payload = withTimeout(4_000) { healthRepository.buildSyncPayload(includeClosedDayWindows = false, includeRunDistance = false) }
                 val result = payload.toString()
                 logDebug("sync:getActivitySyncPayload:done", mapOf("payload" to result))
                 result
