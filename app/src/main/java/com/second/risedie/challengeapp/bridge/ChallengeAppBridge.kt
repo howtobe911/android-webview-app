@@ -109,6 +109,7 @@ class ChallengeAppBridge(
             .put("configured", true)
             .put("source_id", normalizedSourceId)
             .put("periodic_minutes", 15)
+            .put("foreground_minutes", 5)
             .toString()
     }
 
@@ -238,6 +239,7 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
+        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)
     }
 
