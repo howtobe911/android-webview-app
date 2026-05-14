@@ -37,7 +37,7 @@ class HealthSyncWorker(
             val repository = HealthConnectRepository(applicationContext)
             if (!repository.hasPermissions()) return@withContext Result.success()
 
-            val payload = repository.buildSyncPayload()
+            val payload = repository.buildFreshCurrentDaySyncPayload(includeRunDistance = true)
             val batches = payload.optJSONArray("batches") ?: return@withContext Result.success()
             if (batches.length() == 0) return@withContext Result.success()
 

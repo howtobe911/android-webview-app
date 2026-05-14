@@ -240,7 +240,8 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
+        HealthSyncWorker.enqueueImmediate(context)
+        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "immediateSyncQueued" to true))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)
     }
 
@@ -253,7 +254,7 @@ class ChallengeAppBridge(
     fun getActivitySyncPayload(): String {
         return runBlocking {
             try {
-                val payload = withTimeout(4_000) { healthRepository.buildSyncPayload(includeClosedDayWindows = false, includeRunDistance = false) }
+                val payload = withTimeout(8_000) { healthRepository.buildFreshCurrentDaySyncPayload(includeRunDistance = false) }
                 val result = payload.toString()
                 logDebug("sync:getActivitySyncPayload:done", mapOf("payload" to result))
                 result

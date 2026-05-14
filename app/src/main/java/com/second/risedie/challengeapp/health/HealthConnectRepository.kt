@@ -10,6 +10,7 @@ import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -18,6 +19,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.util.Locale
+import kotlin.math.max
 
 class HealthConnectRepository(private val context: Context) {
     private val appContext = context.applicationContext
@@ -48,6 +50,60 @@ class HealthConnectRepository(private val context: Context) {
     }
 
     suspend fun hasPermissions(): Boolean = grantedPermissions().containsAll(permissions)
+
+    /**
+     * Health Connect providers may publish their newest aggregate a moment after the
+     * WebView resumes. Google Fit appears fresh because it opens its own provider UI
+     * and then writes before the user returns. For our app we actively re-read the
+     * same current-day aggregate several times and use the highest monotonic value,
+     * so the first foreground sync is not stuck on the previous cached total.
+     */
+    suspend fun buildFreshCurrentDaySyncPayload(
+        includeRunDistance: Boolean = true,
+        attempts: Int = 4,
+        delayMillis: Long = 450L,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        var bestPayload: JSONObject? = null
+        var bestSteps = -1L
+        var bestGeneratedAt = Instant.EPOCH
+
+        repeat(attempts.coerceAtLeast(1)) { index ->
+            val candidate = buildSyncPayload(includeClosedDayWindows = false, includeRunDistance = includeRunDistance)
+            val candidateSteps = currentDayStepsFromPayload(candidate)
+            val generatedAt = candidate.optString("generated_at").takeIf { it.isNotBlank() }
+                ?.let { runCatching { Instant.parse(it) }.getOrNull() }
+                ?: Instant.now()
+
+            if (candidateSteps > bestSteps || (candidateSteps == bestSteps && generatedAt.isAfter(bestGeneratedAt))) {
+                bestPayload = candidate
+                bestSteps = candidateSteps
+                bestGeneratedAt = generatedAt
+            }
+
+            if (index < attempts - 1) {
+                delay(delayMillis)
+            }
+        }
+
+        bestPayload ?: emptyPayload("Health Connect не вернул payload.")
+    }
+
+    private fun currentDayStepsFromPayload(payload: JSONObject): Long {
+        val batches = payload.optJSONArray("batches") ?: return 0L
+        var maxSteps = 0L
+        for (batchIndex in 0 until batches.length()) {
+            val batch = batches.optJSONObject(batchIndex) ?: continue
+            if (batch.optString("kind") != "walk_steps") continue
+            val records = batch.optJSONArray("records") ?: continue
+            for (recordIndex in 0 until records.length()) {
+                val record = records.optJSONObject(recordIndex) ?: continue
+                if (record.optString("metric_type") == "steps") {
+                    maxSteps = max(maxSteps, record.optLong("value", 0L))
+                }
+            }
+        }
+        return maxSteps
+    }
 
     suspend fun buildSyncPayload(includeClosedDayWindows: Boolean = true, includeRunDistance: Boolean = true): JSONObject = withContext(Dispatchers.IO) {
         val client = clientOrNull() ?: return@withContext emptyPayload("Health Connect недоступен.")
