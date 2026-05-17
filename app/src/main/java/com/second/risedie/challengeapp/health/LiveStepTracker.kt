@@ -5,10 +5,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
-import java.time.ZoneId
+import java.time.LocalDate
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
@@ -16,7 +17,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     private val appContext = context.applicationContext
     private val sensorManager = appContext.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
     private val sensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
-    private val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val overlayStore = LiveActivityOverlayStore(appContext)
     private val started = AtomicBoolean(false)
 
     @Volatile private var rawCounter: Float? = null
@@ -31,6 +32,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
 
     fun stop() {
         if (!started.compareAndSet(true, false)) return
+        runBlocking { persistCurrent() }
         sensorManager?.unregisterListener(this)
     }
 
@@ -38,25 +40,20 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         val value = event.values.firstOrNull() ?: return
         rawCounter = value
         updatedAt = Instant.now()
-        normalizeBaseline(value, updatedAt!!)
+        runBlocking { normalizeBaseline(value, updatedAt!!) }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
-        val zoneId = ZoneId.systemDefault()
-        val dayKey = now.atZone(zoneId).toLocalDate().toString()
+        val dayKey = LocalDate.now().toString()
 
-        if (sensor == null) {
-            return unavailable("На устройстве нет аппаратного Sensor.TYPE_STEP_COUNTER.")
-        }
-
-        if (!activityRecognitionGranted) {
-            return unavailable("Для live-шагов нужно разрешение ACTIVITY_RECOGNITION.")
-        }
+        if (sensor == null) return unavailable("На устройстве нет аппаратного Sensor.TYPE_STEP_COUNTER.")
+        if (!activityRecognitionGranted) return unavailable("Для live-шагов нужно разрешение ACTIVITY_RECOGNITION.")
 
         start()
+        val saved = runBlocking { overlayStore.read() }
         val raw = rawCounter
         if (raw == null) {
             return JSONObject()
@@ -65,15 +62,14 @@ class LiveStepTracker(context: Context) : SensorEventListener {
                 .put("source_day", dayKey)
                 .put("preferred_source", "live_device_step_counter")
                 .put("is_live_ui_only", true)
+                .put("source_of_truth", "native_live_ui")
                 .put("available", true)
                 .put("warming_up", true)
-                .put("steps_today", 0)
+                .put("steps_today", saved.displaySteps)
                 .put("message", "Live-счётчик запускается.")
         }
 
-        val baseline = normalizeBaseline(raw, now)
-        val stepsToday = max(0f, raw - baseline).toLong()
-
+        val state = runBlocking { normalizeBaseline(raw, now) }
         return JSONObject()
             .put("batches", JSONArray())
             .put("generated_at", now.toString())
@@ -81,31 +77,36 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("preferred_source", "live_device_step_counter")
             .put("provider", JSONObject().put("type", "live_device_step_counter").put("name", "Android Live Step Counter").put("priority", 0).put("confidence_score", 0))
             .put("is_live_ui_only", true)
+            .put("source_of_truth", "native_live_ui")
             .put("available", true)
-            .put("steps_today", stepsToday)
+            .put("steps_today", state.displaySteps)
             .put("raw_counter_since_boot", raw.toDouble())
-            .put("baseline_counter", baseline.toDouble())
-            .put("updated_at", (updatedAt ?: now).toString())
+            .put("sensor_base_value", state.sensorBaseValue.toDouble())
+            .put("realtime_delta_steps", state.realtimeDeltaSteps)
+            .put("updated_at", state.updatedAt.toString())
     }
 
-    private fun normalizeBaseline(raw: Float, now: Instant): Float {
-        val dayKey = now.atZone(ZoneId.systemDefault()).toLocalDate().toString()
-        val baselineKey = "baseline_$dayKey"
-        val storedDay = prefs.getString(KEY_LAST_DAY, null)
-        val previousRaw = prefs.getFloat(KEY_LAST_RAW, raw)
-        val baseline = if (storedDay != dayKey || !prefs.contains(baselineKey) || raw < previousRaw) {
-            raw
-        } else {
-            prefs.getFloat(baselineKey, raw)
-        }
+    private suspend fun normalizeBaseline(raw: Float, now: Instant): LiveActivityOverlayState {
+        val dayKey = LocalDate.now().toString()
+        val previous = overlayStore.read()
+        val base = if (previous.activityDate != dayKey || raw < previous.sensorLastValue) raw else previous.sensorBaseValue
+        val delta = max(0f, raw - base).toLong()
+        val display = previous.serverVerifiedSteps + delta
+        val next = previous.copy(
+            activityDate = dayKey,
+            sensorBaseValue = base,
+            sensorLastValue = raw,
+            realtimeDeltaSteps = delta,
+            displaySteps = display,
+            updatedAt = now,
+        )
+        overlayStore.write(next)
+        return next
+    }
 
-        prefs.edit()
-            .putString(KEY_LAST_DAY, dayKey)
-            .putFloat(baselineKey, baseline)
-            .putFloat(KEY_LAST_RAW, raw)
-            .apply()
-
-        return baseline
+    private suspend fun persistCurrent() {
+        val raw = rawCounter ?: return
+        normalizeBaseline(raw, Instant.now())
     }
 
     private fun unavailable(message: String): JSONObject = JSONObject()
@@ -113,12 +114,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         .put("generated_at", Instant.now().toString())
         .put("preferred_source", "live_device_step_counter")
         .put("is_live_ui_only", true)
+        .put("source_of_truth", "native_live_ui")
         .put("available", false)
         .put("message", message)
-
-    companion object {
-        private const val PREFS = "grafit_live_step_counter"
-        private const val KEY_LAST_DAY = "last_day"
-        private const val KEY_LAST_RAW = "last_raw"
-    }
 }

@@ -43,15 +43,22 @@ class HealthSyncWorker(
 
             for (index in 0 until batches.length()) {
                 val batch = batches.optJSONObject(index) ?: continue
+                val kind = batch.optString("kind")
+                if (kind in WINDOW_KINDS && kind != "activity_detail_windows") continue
                 val body = JSONObject()
                     .put("source_id", sourceId)
-                    .put("kind", batch.optString("kind"))
+                    .put("kind", kind)
                     .put("external_batch_id", batch.optString("external_batch_id"))
                     .put("generated_at", batch.optString("generated_at", payload.optString("generated_at")))
                     .put("device_time", batch.optString("device_time", payload.optString("device_time")))
                     .put("source_day", batch.optString("source_day", payload.optString("source_day")))
                     .put("timezone", batch.optString("timezone", payload.optString("timezone")))
                     .put("records", batch.optJSONArray("records"))
+                    .put("is_live_ui_only", false)
+                    .put("source_of_truth", "health_connect")
+                    .put("health_connect_read_at", payload.optString("generated_at"))
+                    .put("activity_date", batch.optString("source_day", payload.optString("source_day")))
+                    .put("client_observed_at", payload.optString("device_time", payload.optString("generated_at")))
                     .apply {
                         if (batch.has("window_size_minutes")) {
                             put("window_size_minutes", batch.optInt("window_size_minutes", 15))
@@ -151,7 +158,8 @@ class HealthSyncWorker(
         private const val KEY_TOKEN = "auth_token"
         private const val KEY_API_BASE = "api_base"
         private const val KEY_SOURCE_ID = "source_id"
-        private val FINAL_WINDOW_KINDS = setOf("walk_steps_windows", "activity_windows", "activity_detail_windows")
+        private val WINDOW_KINDS = setOf("walk_steps_windows", "activity_windows", "activity_detail_windows")
+        private val FINAL_WINDOW_KINDS = setOf("activity_detail_windows")
         private const val PERIODIC_WORK = "grafit_health_connect_periodic_sync"
         private const val IMMEDIATE_WORK = "grafit_health_connect_immediate_sync"
         private const val FAST_LOOP_WORK = "grafit_health_connect_fast_loop_sync"
