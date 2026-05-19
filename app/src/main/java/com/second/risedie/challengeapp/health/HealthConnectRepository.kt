@@ -137,7 +137,7 @@ class HealthConnectRepository(private val context: Context) {
 
 
         if (includeClosedDayWindows) {
-            buildActivityWindowsBatch(client, day.minusDays(1), zoneId, now)?.let { batches.put(it) }
+            buildActivityWindowsBatch(client, day.minusDays(1), serverZoneId, now)?.let { batches.put(it) }
         }
         if (stepsTotal > 0L) {
             batches.put(
