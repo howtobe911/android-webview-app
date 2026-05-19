@@ -163,7 +163,7 @@ class HealthSyncWorker(
         private const val PERIODIC_WORK = "grafit_health_connect_periodic_sync"
         private const val IMMEDIATE_WORK = "grafit_health_connect_immediate_sync"
         private const val FAST_LOOP_WORK = "grafit_health_connect_fast_loop_sync"
-        private const val FAST_LOOP_MINUTES = 5L
+        private const val FAST_LOOP_MINUTES = 1L
 
         fun configure(context: Context, token: String, apiBase: String, sourceId: Long) {
             context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

@@ -72,6 +72,25 @@ class LiveStepTracker(context: Context) : SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
+    fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
+        val now = Instant.now()
+        synchronized(stateLock) {
+            val currentRaw = rawCounter ?: cachedState?.sensorLastValue ?: 0f
+            val safeSteps = max(0L, serverSteps)
+            cachedState = LiveActivityOverlayState(
+                activityDate = activityDate.ifBlank { LocalDate.now().toString() },
+                serverVerifiedSteps = safeSteps,
+                sensorBaseValue = currentRaw,
+                sensorLastValue = currentRaw,
+                realtimeDeltaSteps = 0L,
+                displaySteps = safeSteps,
+                lastHealthConnectReadAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now,
+                updatedAt = now,
+            )
+        }
+        persistCurrentThrottled(force = true)
+    }
+
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
         val dayKey = LocalDate.now().toString()

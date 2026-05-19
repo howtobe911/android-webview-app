@@ -18,7 +18,9 @@ import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.Locale
+import java.util.UUID
 import kotlin.math.max
 
 class HealthConnectRepository(private val context: Context) {
@@ -109,11 +111,13 @@ class HealthConnectRepository(private val context: Context) {
         val client = clientOrNull() ?: return@withContext emptyPayload("Health Connect недоступен.")
         if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
 
-        val zoneId = ZoneId.systemDefault()
-        val timezone = zoneId.id
+        val deviceZoneId = ZoneId.systemDefault()
+        val timezone = deviceZoneId.id
+        val serverZoneId = ZoneOffset.UTC
         val now = Instant.now()
-        val day = now.atZone(zoneId).toLocalDate()
-        val startOfDay = day.atStartOfDay(zoneId).toInstant()
+        val day = now.atZone(serverZoneId).toLocalDate()
+        val deviceDay = now.atZone(deviceZoneId).toLocalDate()
+        val startOfDay = day.atStartOfDay(serverZoneId).toInstant()
         val warnings = JSONArray()
 
         val stepsTotal = readStepsTotal(client, startOfDay, now, warnings)
@@ -139,7 +143,7 @@ class HealthConnectRepository(private val context: Context) {
             batches.put(
                 JSONObject()
                     .put("kind", "walk_steps")
-                    .put("external_batch_id", "health-connect-steps-${startOfDay.epochSecond}")
+                    .put("external_batch_id", uniqueBatchId("android-steps", now))
                     .put("generated_at", now.toString())
                     .put("device_time", now.toString())
                     .put("source_day", day.toString())
@@ -155,9 +159,8 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("recorded_to", now.toString())
                                 .put("client_generated_at", now.toString())
                                 .put("device_time", now.toString())
-                                .put("source_day", day.toString())
+                                .put("source_day", deviceDay.toString())
                                 .put("client_timezone", timezone)
-                                .put("source_hash", "health-connect-steps-${startOfDay.epochSecond}-$stepsTotal")
                         )
                     )
             )
@@ -168,7 +171,7 @@ class HealthConnectRepository(private val context: Context) {
             batches.put(
                 JSONObject()
                     .put("kind", "run_distance")
-                    .put("external_batch_id", "health-connect-distance-${startOfDay.epochSecond}")
+                    .put("external_batch_id", uniqueBatchId("android-distance", now))
                     .put("generated_at", now.toString())
                     .put("device_time", now.toString())
                     .put("source_day", day.toString())
@@ -184,9 +187,8 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("recorded_to", now.toString())
                                 .put("client_generated_at", now.toString())
                                 .put("device_time", now.toString())
-                                .put("source_day", day.toString())
+                                .put("source_day", deviceDay.toString())
                                 .put("client_timezone", timezone)
-                                .put("source_hash", "health-connect-distance-${startOfDay.epochSecond}-$normalizedDistance")
                         )
                     )
             )
@@ -393,6 +395,8 @@ class HealthConnectRepository(private val context: Context) {
         .put("name", "Health Connect")
         .put("priority", 80)
         .put("confidence_score", 88)
+
+    private fun uniqueBatchId(prefix: String, now: Instant): String = "$prefix-${now.toEpochMilli()}-${UUID.randomUUID()}"
 
     companion object {
         const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"

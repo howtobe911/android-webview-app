@@ -109,8 +109,21 @@ class ChallengeAppBridge(
             .put("configured", true)
             .put("source_id", normalizedSourceId)
             .put("periodic_minutes", 15)
-            .put("foreground_minutes", 5)
+            .put("foreground_minutes", 1)
             .put("immediate_sync_queued", true)
+            .toString()
+    }
+
+
+    @JavascriptInterface
+    fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {
+        val day = activityDate?.trim().orEmpty()
+        val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
+        liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
+        return JSONObject()
+            .put("reset", true)
+            .put("activity_date", day)
+            .put("server_steps", steps)
             .toString()
     }
 
