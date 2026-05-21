@@ -8,16 +8,14 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
 import java.time.Instant
-import java.time.LocalDate
 
 private val Context.liveActivityOverlayDataStore by preferencesDataStore(name = "grafit_live_activity_overlay")
 
 class LiveActivityOverlayStore(private val context: Context) {
     suspend fun read(): LiveActivityOverlayState {
         val data = context.liveActivityOverlayDataStore.data.first()
-        val today = LocalDate.now().toString()
         return LiveActivityOverlayState(
-            activityDate = data[ACTIVITY_DATE] ?: today,
+            activityDate = data[ACTIVITY_DATE] ?: "",
             serverVerifiedSteps = data[SERVER_VERIFIED_STEPS] ?: 0L,
             serverVerifiedRunMeters = data[SERVER_VERIFIED_RUN_METERS] ?: 0L,
             serverVerifiedRunSeconds = data[SERVER_VERIFIED_RUN_SECONDS] ?: 0L,

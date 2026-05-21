@@ -14,7 +14,6 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
-import java.time.LocalDate
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 
@@ -72,18 +71,29 @@ class LiveStepTracker(context: Context) : SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-    fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
+    fun reconcileAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
+        val serverDay = activityDate.trim()
+        if (serverDay.isBlank()) return
+
         val now = Instant.now()
         synchronized(stateLock) {
-            val currentRaw = rawCounter ?: cachedState?.sensorLastValue ?: 0f
+            val previous = cachedState ?: runBlocking { overlayStore.read() }
+            val currentRaw = rawCounter ?: previous.sensorLastValue
             val safeSteps = max(0L, serverSteps)
+            val sameServerDay = previous.activityDate == serverDay
+            val optimisticDelta = if (sameServerDay) {
+                max(0L, previous.displaySteps - safeSteps)
+            } else {
+                0L
+            }
+
             cachedState = LiveActivityOverlayState(
-                activityDate = activityDate.ifBlank { LocalDate.now().toString() },
+                activityDate = serverDay,
                 serverVerifiedSteps = safeSteps,
                 sensorBaseValue = currentRaw,
                 sensorLastValue = currentRaw,
-                realtimeDeltaSteps = 0L,
-                displaySteps = safeSteps,
+                realtimeDeltaSteps = optimisticDelta,
+                displaySteps = safeSteps + optimisticDelta,
                 lastHealthConnectReadAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now,
                 updatedAt = now,
             )
@@ -91,9 +101,13 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         persistCurrentThrottled(force = true)
     }
 
+    fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
+        reconcileAnchorFromServer(activityDate, serverSteps, serverRecordedAt)
+    }
+
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
-        val dayKey = LocalDate.now().toString()
+        val dayKey = ensureState(now).activityDate
 
         if (counterSensor == null && detectorSensor == null) return unavailable("На устройстве нет аппаратного счётчика шагов.")
         if (!activityRecognitionGranted) return unavailable("Для live-шагов нужно разрешение ACTIVITY_RECOGNITION.")
@@ -135,34 +149,31 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("updated_at", current.updatedAt.toString())
     }
 
+    /**
+     * No local/UTC midnight reset here. The active overlay day is reconciled only from
+     * the server snapshot/sync window. When server_day changes, the old optimistic
+     * overlay is simply ignored because the new server_day has its own namespace.
+     */
     private fun ensureState(now: Instant): LiveActivityOverlayState {
-        cachedState?.let { cached ->
-            return resetForNewDayIfNeeded(cached, now)
-        }
+        cachedState?.let { return it }
         val loaded = runBlocking { overlayStore.read() }
-        cachedState = resetForNewDayIfNeeded(loaded, now)
+        cachedState = ensureInitializedState(loaded, now)
         return cachedState!!
     }
 
-    private fun resetForNewDayIfNeeded(state: LiveActivityOverlayState, now: Instant): LiveActivityOverlayState {
-        val dayKey = LocalDate.now().toString()
-        if (state.activityDate == dayKey) return state
-        val reset = LiveActivityOverlayState(
-            activityDate = dayKey,
-            sensorBaseValue = rawCounter ?: state.sensorLastValue,
-            sensorLastValue = rawCounter ?: state.sensorLastValue,
-            updatedAt = now,
-        )
-        cachedState = reset
+    private fun ensureInitializedState(state: LiveActivityOverlayState, now: Instant): LiveActivityOverlayState {
+        if (state.activityDate.isNotBlank()) return state
+        val initialized = state.copy(updatedAt = now)
+        cachedState = initialized
         persistCurrentThrottled(force = true)
-        return reset
+        return initialized
     }
 
     private fun updateState(now: Instant, raw: Float?, detectorPulse: Long) {
         synchronized(stateLock) {
             val previous = ensureState(now)
-            val dayKey = LocalDate.now().toString()
-            val dayState = if (previous.activityDate == dayKey) previous else LiveActivityOverlayState(activityDate = dayKey, updatedAt = now)
+            val dayKey = previous.activityDate
+            val dayState = previous
 
             val base = when {
                 raw == null -> dayState.sensorBaseValue

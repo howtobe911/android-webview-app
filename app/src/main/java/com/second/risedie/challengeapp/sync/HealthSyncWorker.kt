@@ -11,6 +11,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.Constraints
 import com.second.risedie.challengeapp.health.HealthConnectRepository
+import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -21,6 +22,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 
 class HealthSyncWorker(
@@ -37,7 +39,8 @@ class HealthSyncWorker(
             val repository = HealthConnectRepository(applicationContext)
             if (!repository.hasPermissions()) return@withContext Result.success()
 
-            val payload = repository.buildFreshCurrentDaySyncPayload(includeRunDistance = true)
+            val syncWindow = fetchSyncWindow(apiBase, token)
+            val payload = repository.buildFreshServerWindowSyncPayload(serverWindow = syncWindow, includeRunDistance = true)
             val batches = payload.optJSONArray("batches") ?: return@withContext Result.success()
             if (batches.length() == 0) return@withContext Result.success()
 
@@ -51,13 +54,19 @@ class HealthSyncWorker(
                     .put("external_batch_id", batch.optString("external_batch_id"))
                     .put("generated_at", batch.optString("generated_at", payload.optString("generated_at")))
                     .put("device_time", batch.optString("device_time", payload.optString("device_time")))
+                    .put("server_day", syncWindow.serverDay)
+                    .put("activity_date", syncWindow.serverDay)
                     .put("source_day", batch.optString("source_day", payload.optString("source_day")))
                     .put("timezone", batch.optString("timezone", payload.optString("timezone")))
+                    .put("server_timezone", syncWindow.serverTimezone)
+                    .put("window_from_utc", syncWindow.windowFromUtc.toString())
+                    .put("window_to_utc", syncWindow.windowToUtc.toString())
+                    .put("server_day_ends_at_utc", syncWindow.serverDayEndsAtUtc.toString())
+                    .put("source_day_role", "metadata_only")
                     .put("records", batch.optJSONArray("records"))
                     .put("is_live_ui_only", false)
                     .put("source_of_truth", "health_connect")
                     .put("health_connect_read_at", payload.optString("generated_at"))
-                    .put("activity_date", batch.optString("source_day", payload.optString("source_day")))
                     .put("client_observed_at", payload.optString("device_time", payload.optString("generated_at")))
                     .apply {
                         if (batch.has("window_size_minutes")) {
@@ -77,11 +86,46 @@ class HealthSyncWorker(
     }
 
 
+    private fun fetchSyncWindow(apiBase: String, token: String): ServerSyncWindow {
+        val response = getJsonForResponse("$apiBase/api/v1/me/activity/sync-window", token)
+        val data = response.optJSONObject("data") ?: response
+        return ServerSyncWindow(
+            serverDay = data.optString("server_day"),
+            serverTimezone = data.optString("server_timezone", "Europe/Moscow"),
+            windowFromUtc = Instant.parse(data.optString("window_from_utc")),
+            windowToUtc = Instant.parse(data.optString("window_to_utc")),
+            serverDayEndsAtUtc = Instant.parse(data.optString("server_day_ends_at_utc")),
+        )
+    }
+
+    private fun getJsonForResponse(url: String, token: String): JSONObject {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 20_000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Authorization", "Bearer $token")
+        }
+
+        try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val text = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+            if (code !in 200..299) {
+                throw IllegalStateException("Health sync window failed with HTTP $code")
+            }
+            return JSONObject(text)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+
     private fun attachPayloadSecurityIfNeeded(apiBase: String, token: String, body: JSONObject) {
         val kind = body.optString("kind")
         if (kind !in FINAL_WINDOW_KINDS) return
 
-        val activityDate = body.optString("source_day").takeIf { it.length >= 10 }?.substring(0, 10) ?: return
+        val activityDate = body.optString("server_day").takeIf { it.length >= 10 }?.substring(0, 10) ?: return
         val nonceResponse = postJsonForResponse(
             "$apiBase/api/v1/me/activity/payload-nonce",
             token,

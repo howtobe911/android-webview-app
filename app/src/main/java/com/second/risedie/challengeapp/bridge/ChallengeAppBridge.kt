@@ -14,6 +14,7 @@ import androidx.health.connect.client.PermissionController
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
+import com.second.risedie.challengeapp.health.ServerSyncWindow
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,6 +28,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -119,9 +124,9 @@ class ChallengeAppBridge(
     fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {
         val day = activityDate?.trim().orEmpty()
         val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
-        liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
+        liveStepTracker.reconcileAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
         return JSONObject()
-            .put("reset", true)
+            .put("reconciled", true)
             .put("activity_date", day)
             .put("server_steps", steps)
             .toString()
@@ -267,7 +272,14 @@ class ChallengeAppBridge(
     fun getActivitySyncPayload(): String {
         return runBlocking {
             try {
-                val payload = withTimeout(8_000) { healthRepository.buildFreshCurrentDaySyncPayload(includeRunDistance = false) }
+                val serverWindow = configuredSyncWindow()
+                    ?: return@runBlocking JSONObject()
+                        .put("batches", JSONArray())
+                        .put("generated_at", Instant.now().toString())
+                        .put("preferred_source", "health_connect")
+                        .put("message", "Серверное окно активности ещё не получено.")
+                        .toString()
+                val payload = withTimeout(8_000) { healthRepository.buildFreshServerWindowSyncPayload(serverWindow = serverWindow, includeRunDistance = false) }
                 val result = payload.toString()
                 logDebug("sync:getActivitySyncPayload:done", mapOf("payload" to result))
                 result
@@ -282,6 +294,41 @@ class ChallengeAppBridge(
             }
         }
     }
+
+    private suspend fun configuredSyncWindow(): ServerSyncWindow? = withContext(Dispatchers.IO) {
+        val prefs = context.getSharedPreferences("grafit_native_health_sync", Context.MODE_PRIVATE)
+        val token = prefs.getString("auth_token", null)?.takeIf { it.isNotBlank() } ?: return@withContext null
+        val apiBase = prefs.getString("api_base", null)?.trimEnd('/')?.takeIf { it.startsWith("https://") } ?: return@withContext null
+
+        val connection = (URL("$apiBase/api/v1/me/activity/sync-window").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 20_000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Authorization", "Bearer $token")
+        }
+
+        try {
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val text = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+            if (code !in 200..299) return@withContext null
+            val response = JSONObject(text)
+            val data = response.optJSONObject("data") ?: response
+            ServerSyncWindow(
+                serverDay = data.optString("server_day"),
+                serverTimezone = data.optString("server_timezone", "Europe/Moscow"),
+                windowFromUtc = Instant.parse(data.optString("window_from_utc")),
+                windowToUtc = Instant.parse(data.optString("window_to_utc")),
+                serverDayEndsAtUtc = Instant.parse(data.optString("server_day_ends_at_utc")),
+            )
+        } catch (_: Throwable) {
+            null
+        } finally {
+            connection.disconnect()
+        }
+    }
+
 
     @JavascriptInterface
     fun getLiveActivitySnapshot(): String {
