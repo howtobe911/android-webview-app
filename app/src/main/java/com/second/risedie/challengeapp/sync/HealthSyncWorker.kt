@@ -75,10 +75,8 @@ class HealthSyncWorker(
                 postJson("$apiBase/api/v1/me/sources/sync", token, body)
             }
 
-            enqueueFastLoop(applicationContext)
             Result.success()
         } catch (_: Throwable) {
-            enqueueFastLoop(applicationContext)
             Result.retry()
         }
     }
@@ -96,7 +94,7 @@ class HealthSyncWorker(
         }
         return ServerSyncWindow(
             serverDay = serverDay,
-            serverTimezone = data.optString("server_timezone", "Europe/Moscow"),
+            serverTimezone = data.optString("server_timezone", "UTC"),
             windowFromUtc = Instant.parse(windowFrom),
             windowToUtc = Instant.parse(windowTo),
             serverDayEndsAtUtc = Instant.parse(endsAt),
@@ -211,8 +209,6 @@ class HealthSyncWorker(
         private val FINAL_WINDOW_KINDS = setOf("activity_detail_windows")
         private const val PERIODIC_WORK = "grafit_health_connect_periodic_sync"
         private const val IMMEDIATE_WORK = "grafit_health_connect_immediate_sync"
-        private const val FAST_LOOP_WORK = "grafit_health_connect_fast_loop_sync"
-        private const val FAST_LOOP_MINUTES = 1L
 
         fun configure(context: Context, token: String, apiBase: String, sourceId: Long) {
             context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -243,19 +239,6 @@ class HealthSyncWorker(
                 .build()
             WorkManager.getInstance(context.applicationContext)
                 .enqueueUniquePeriodicWork(PERIODIC_WORK, ExistingPeriodicWorkPolicy.UPDATE, request)
-            enqueueFastLoop(context)
-        }
-
-        fun enqueueFastLoop(context: Context) {
-            val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build()
-            val request = OneTimeWorkRequestBuilder<HealthSyncWorker>()
-                .setInitialDelay(FAST_LOOP_MINUTES, TimeUnit.MINUTES)
-                .setConstraints(constraints)
-                .build()
-            WorkManager.getInstance(context.applicationContext)
-                .enqueueUniqueWork(FAST_LOOP_WORK, ExistingWorkPolicy.REPLACE, request)
         }
     }
 }

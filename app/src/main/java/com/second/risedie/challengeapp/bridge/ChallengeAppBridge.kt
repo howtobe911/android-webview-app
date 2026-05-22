@@ -15,7 +15,7 @@ import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.health.ServerSyncWindow
-import com.second.risedie.challengeapp.sync.HealthSyncWorker
+import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -42,6 +42,7 @@ class ChallengeAppBridge(
     private val isActivityRecognitionGranted: () -> Boolean,
     private val onNotifyJavascript: (String) -> Unit,
     private val onDebugJavascript: (String) -> Unit,
+    private val onActivitySyncJavascript: (String) -> Unit,
 ) {
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -49,6 +50,7 @@ class ChallengeAppBridge(
     private val permissionsMutex = Mutex()
     private val healthRepository = HealthConnectRepository(context)
     private val liveStepTracker = LiveStepTracker(context)
+    private val foregroundSyncEngine = ForegroundHealthSyncEngine(context) { eventJson -> onActivitySyncJavascript(eventJson) }
 
     @Volatile
     private var cachedPermissionPayload: String = permissionPayload(
@@ -62,7 +64,6 @@ class ChallengeAppBridge(
         logDebug("bridge:init")
         emitDebugEvent("bridge:init", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        HealthSyncWorker.enqueuePeriodic(context)
         refreshPermissionState(notifyJavascript = false, enqueueNativeSync = false)
     }
 
@@ -105,17 +106,15 @@ class ChallengeAppBridge(
                 .toString()
         }
 
-        HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
-        HealthSyncWorker.enqueuePeriodic(context)
-        HealthSyncWorker.enqueueImmediate(context)
-        emitDebugEvent("native_worker:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId))
+        foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
+        emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId))
 
         return JSONObject()
             .put("configured", true)
             .put("source_id", normalizedSourceId)
-            .put("periodic_minutes", 15)
-            .put("foreground_minutes", 1)
-            .put("immediate_sync_queued", true)
+            .put("server_timezone", "UTC")
+            .put("foreground_loop_seconds", 300)
+            .put("immediate_sync_queued", false)
             .toString()
     }
 
@@ -134,8 +133,12 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun triggerNativeHealthSync(): String {
-        HealthSyncWorker.enqueueImmediate(context)
-        return JSONObject().put("queued", true).toString()
+        return requestForegroundSync("manual_refresh")
+    }
+
+    @JavascriptInterface
+    fun requestForegroundSync(reason: String?): String {
+        return foregroundSyncEngine.requestForegroundSync(reason?.trim().orEmpty()).toString()
     }
 
     @JavascriptInterface
@@ -211,7 +214,7 @@ class ChallengeAppBridge(
                     )
                     cachedPermissionPayload = grantedPayload
                     onNotifyJavascript(grantedPayload)
-                    HealthSyncWorker.enqueueImmediate(context)
+                    foregroundSyncEngine.requestForegroundSync("permission_granted")
                     return@launch
                 }
 
@@ -258,13 +261,18 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        HealthSyncWorker.enqueueImmediate(context)
-        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "immediateSyncQueued" to true))
+        foregroundSyncEngine.onAppForeground("app_resume")
+        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to true))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)
+    }
+
+    fun onHostStopped() {
+        foregroundSyncEngine.onAppBackground()
     }
 
     fun dispose() {
         liveStepTracker.stop()
+        foregroundSyncEngine.onAppBackground()
         bridgeScope.cancel()
     }
 
@@ -317,7 +325,7 @@ class ChallengeAppBridge(
             val data = response.optJSONObject("data") ?: response
             ServerSyncWindow(
                 serverDay = data.optString("server_day"),
-                serverTimezone = data.optString("server_timezone", "Europe/Moscow"),
+                serverTimezone = data.optString("server_timezone", "UTC"),
                 windowFromUtc = Instant.parse(data.optString("window_from_utc")),
                 windowToUtc = Instant.parse(data.optString("window_to_utc")),
                 serverDayEndsAtUtc = Instant.parse(data.optString("server_day_ends_at_utc")),
@@ -403,7 +411,7 @@ class ChallengeAppBridge(
                         permissionPayload(false, false, false, "Health Connect не инициализировался.")
                     } else {
                         val granted = safeGrantedPermissions(client).containsAll(healthRepository.permissions)
-                        if (granted && enqueueNativeSync) HealthSyncWorker.enqueueImmediate(context)
+                        if (granted && enqueueNativeSync) foregroundSyncEngine.requestForegroundSync("permission_granted")
                         permissionPayload(
                             available = true,
                             granted = granted,

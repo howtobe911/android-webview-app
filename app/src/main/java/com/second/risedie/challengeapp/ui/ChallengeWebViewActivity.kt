@@ -69,6 +69,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             isActivityRecognitionGranted = { isActivityRecognitionGranted() },
             onNotifyJavascript = { eventJson -> dispatchJavascriptEvent(eventJson) },
             onDebugJavascript = { eventJson -> dispatchJavascriptDebugEvent(eventJson) },
+            onActivitySyncJavascript = { eventJson -> dispatchActivitySyncEvent(eventJson) },
         )
 
         configureWebView(webView)
@@ -105,6 +106,11 @@ class ChallengeWebViewActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         bridge.onHostResumed()
+    }
+
+    override fun onStop() {
+        bridge.onHostStopped()
+        super.onStop()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -193,6 +199,24 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
 
 
+
+
+    private fun dispatchActivitySyncEvent(eventJson: String) {
+        Log.d(LOG_TAG, "dispatchActivitySyncEvent payload=$eventJson")
+        val quoted = JSONObject.quote(eventJson)
+        val script = """
+            (function() {
+                var payload = JSON.parse($quoted);
+                window.dispatchEvent(new CustomEvent('grafit:activity-sync', { detail: payload }));
+            })();
+        """.trimIndent()
+
+        webView.post {
+            if (!isFinishing && !isDestroyed) {
+                webView.evaluateJavascript(script, null)
+            }
+        }
+    }
 
     private fun dispatchJavascriptDebugEvent(eventJson: String) {
         Log.d(LOG_TAG, "dispatchJavascriptDebugEvent payload=$eventJson")
