@@ -123,7 +123,7 @@ class ChallengeAppBridge(
     fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {
         val day = activityDate?.trim().orEmpty()
         val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
-        liveStepTracker.reconcileAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
+        liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
         return JSONObject()
             .put("reconciled", true)
             .put("activity_date", day)

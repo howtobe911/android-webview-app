@@ -102,7 +102,27 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     }
 
     fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
-        reconcileAnchorFromServer(activityDate, serverSteps, serverRecordedAt)
+        val serverDay = activityDate.trim()
+        if (serverDay.isBlank()) return
+
+        val now = Instant.now()
+        synchronized(stateLock) {
+            val previous = cachedState ?: runBlocking { overlayStore.read() }
+            val currentRaw = rawCounter ?: previous.sensorLastValue
+            val safeSteps = max(0L, serverSteps)
+
+            cachedState = LiveActivityOverlayState(
+                activityDate = serverDay,
+                serverVerifiedSteps = safeSteps,
+                sensorBaseValue = currentRaw,
+                sensorLastValue = currentRaw,
+                realtimeDeltaSteps = 0L,
+                displaySteps = safeSteps,
+                lastHealthConnectReadAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now,
+                updatedAt = now,
+            )
+        }
+        persistCurrentThrottled(force = true)
     }
 
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
