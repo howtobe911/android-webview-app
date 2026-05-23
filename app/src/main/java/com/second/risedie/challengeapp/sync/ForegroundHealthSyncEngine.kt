@@ -131,7 +131,7 @@ class ForegroundHealthSyncEngine(
         val syncWindow = fetchSyncWindow(apiBase, token)
         require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
 
-        val payload = repository.buildFreshServerWindowSyncPayload(syncWindow, includeRunDistance = true, attempts = 4, delayMillis = 550L)
+        val payload = repository.buildFreshServerWindowSyncPayload(syncWindow, includeRunDistance = true, attempts = 8, delayMillis = 750L)
         val batches = payload.optJSONArray("batches") ?: JSONArray()
         if (batches.length() == 0) {
             return@withContext JSONObject()

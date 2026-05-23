@@ -165,9 +165,11 @@ class HealthConnectRepository(private val context: Context) {
         if (includeClosedDayWindows) {
             buildActivityWindowsBatch(client, day.minusDays(1), ZoneId.of(effectiveWindow.serverTimezone), now)?.let { batches.put(it) }
         }
-        if (stepsTotal > 0L) {
-            batches.put(
-                JSONObject()
+        // Server-window aggregate: even 0 is a valid confirmed result for the current UTC day.
+        // Do not skip the batch when Health Connect returns zero; backend must receive
+        // and persist the authoritative activity_current_state for this server window.
+        batches.put(
+            JSONObject()
                     .put("kind", "walk_steps")
                     .put("external_batch_id", uniqueBatchId("android-steps-serverday-${effectiveWindow.serverDay}", now))
                     .put("generated_at", now.toString())
@@ -197,8 +199,7 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("client_timezone", "UTC")
                         )
                     )
-            )
-        }
+        )
 
         if (distanceMeters > 0.0) {
             val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()

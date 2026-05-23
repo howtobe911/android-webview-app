@@ -107,14 +107,17 @@ class ChallengeAppBridge(
         }
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
-        emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId))
+        foregroundSyncEngine.startForegroundLoop()
+        val immediate = foregroundSyncEngine.requestForegroundSync("configured")
+        emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId, "requestId" to immediate.optString("request_id")))
 
         return JSONObject()
             .put("configured", true)
             .put("source_id", normalizedSourceId)
             .put("server_timezone", "UTC")
             .put("foreground_loop_seconds", 300)
-            .put("immediate_sync_queued", false)
+            .put("immediate_sync_queued", true)
+            .put("request_id", immediate.optString("request_id"))
             .toString()
     }
 
