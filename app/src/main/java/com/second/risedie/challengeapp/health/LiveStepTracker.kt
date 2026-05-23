@@ -169,6 +169,73 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("updated_at", current.updatedAt.toString())
     }
 
+
+    /**
+     * Returns the best monotonic steps total for the current server UTC day.
+     *
+     * Important: TYPE_STEP_COUNTER is a since-boot counter, not a queryable historical
+     * aggregate. Therefore this method can only add native deltas that were observed
+     * after the app established a server-day anchor. Health Connect still covers
+     * historical/watch data for the same UTC server window.
+     */
+    fun serverWindowStepsSnapshot(serverWindow: ServerSyncWindow, healthConnectSteps: Long): Long {
+        val now = Instant.now()
+        val serverDay = serverWindow.serverDay.trim()
+        val safeHealthSteps = max(0L, healthConnectSteps)
+        if (serverDay.isBlank()) return safeHealthSteps
+
+        start()
+        rawCounter?.let { updateState(now = now, raw = it, detectorPulse = 0L) }
+
+        synchronized(stateLock) {
+            val previous = cachedState ?: runBlocking { overlayStore.read() }
+            val currentRaw = rawCounter ?: previous.sensorLastValue
+
+            val dayState = if (previous.activityDate != serverDay) {
+                LiveActivityOverlayState(
+                    activityDate = serverDay,
+                    serverVerifiedSteps = safeHealthSteps,
+                    sensorBaseValue = currentRaw,
+                    sensorLastValue = currentRaw,
+                    realtimeDeltaSteps = 0L,
+                    displaySteps = safeHealthSteps,
+                    lastHealthConnectReadAt = now,
+                    updatedAt = now,
+                )
+            } else {
+                val base = when {
+                    currentRaw <= 0f -> previous.sensorBaseValue
+                    previous.sensorBaseValue <= 0f -> currentRaw
+                    currentRaw < previous.sensorLastValue -> currentRaw
+                    else -> previous.sensorBaseValue
+                }
+                val counterDelta = if (currentRaw > 0f) max(0f, currentRaw - base).toLong() else previous.realtimeDeltaSteps
+                val realtimeDelta = max(previous.realtimeDeltaSteps, counterDelta)
+
+                // Native candidate is the old trusted anchor plus the native delta.
+                // Health Connect candidate is the aggregate for the same UTC server window.
+                // Use max(), never health + delta, otherwise HC catch-up double-counts steps.
+                val nativeCandidate = max(previous.serverVerifiedSteps, previous.displaySteps)
+                val nextDisplay = max(safeHealthSteps, max(nativeCandidate, previous.serverVerifiedSteps + realtimeDelta))
+
+                previous.copy(
+                    activityDate = serverDay,
+                    serverVerifiedSteps = max(previous.serverVerifiedSteps, safeHealthSteps),
+                    sensorBaseValue = base,
+                    sensorLastValue = if (currentRaw > 0f) currentRaw else previous.sensorLastValue,
+                    realtimeDeltaSteps = realtimeDelta,
+                    displaySteps = nextDisplay,
+                    lastHealthConnectReadAt = now,
+                    updatedAt = now,
+                )
+            }
+
+            cachedState = dayState
+            persistCurrentThrottled(force = true)
+            return max(safeHealthSteps, dayState.displaySteps)
+        }
+    }
+
     /**
      * No local/UTC midnight reset here. The active overlay day is reconciled only from
      * the server snapshot/sync window. When server_day changes, the old optimistic

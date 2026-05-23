@@ -3,6 +3,7 @@ package com.second.risedie.challengeapp.sync
 import android.content.Context
 import androidx.health.connect.client.HealthConnectClient
 import com.second.risedie.challengeapp.health.HealthConnectRepository
+import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +31,7 @@ import javax.crypto.spec.SecretKeySpec
 
 class ForegroundHealthSyncEngine(
     context: Context,
+    private val liveStepTracker: LiveStepTracker,
     private val emitSyncEvent: (String) -> Unit,
 ) {
     private val appContext = context.applicationContext
@@ -129,6 +131,7 @@ class ForegroundHealthSyncEngine(
         require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
 
         val payload = repository.buildFreshServerWindowSyncPayload(syncWindow, includeRunDistance = true, attempts = 8, delayMillis = 750L)
+        applyNativeMaxForServerWindowSteps(payload, syncWindow)
         val batches = payload.optJSONArray("batches") ?: JSONArray()
         if (batches.length() == 0) {
             return@withContext JSONObject()
@@ -210,6 +213,35 @@ class ForegroundHealthSyncEngine(
             .put("current_state", currentState ?: JSONObject())
             .put("should_reload_snapshot", fresh)
             .put("synced_at", Instant.now().toString())
+    }
+
+
+    private fun applyNativeMaxForServerWindowSteps(payload: JSONObject, syncWindow: ServerSyncWindow) {
+        val batches = payload.optJSONArray("batches") ?: return
+        for (batchIndex in 0 until batches.length()) {
+            val batch = batches.optJSONObject(batchIndex) ?: continue
+            if (batch.optString("kind") != "walk_steps") continue
+            val records = batch.optJSONArray("records") ?: continue
+            for (recordIndex in 0 until records.length()) {
+                val record = records.optJSONObject(recordIndex) ?: continue
+                if (record.optString("activity_type") != "walk" || record.optString("metric_type") != "steps") continue
+
+                val healthSteps = record.optLong("value", 0L).coerceAtLeast(0L)
+                val nativeSteps = liveStepTracker.serverWindowStepsSnapshot(syncWindow, healthSteps)
+                val finalSteps = maxOf(healthSteps, nativeSteps)
+
+                record.put("value", finalSteps)
+                record.put("health_connect_value", healthSteps)
+                record.put("native_step_counter_value", nativeSteps)
+                record.put("source_of_truth", "max_native_step_counter_health_connect")
+                batch.put("source_of_truth", "max_native_step_counter_health_connect")
+                batch.put("health_connect_value", healthSteps)
+                batch.put("native_step_counter_value", nativeSteps)
+                batch.put("max_value", finalSteps)
+                payload.put("preferred_source", "max_native_step_counter_health_connect")
+                return
+            }
+        }
     }
 
     private fun fail(type: String, requestId: String, reason: String, message: String): JSONObject = JSONObject()
