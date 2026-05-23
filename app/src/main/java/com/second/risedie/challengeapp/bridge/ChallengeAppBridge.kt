@@ -16,6 +16,7 @@ import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
+import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -107,6 +108,9 @@ class ChallengeAppBridge(
         }
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
+        HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
+        HealthSyncWorker.enqueuePeriodic(context)
+        HealthSyncWorker.enqueueImmediate(context)
         foregroundSyncEngine.startForegroundLoop()
         val immediate = foregroundSyncEngine.requestForegroundSync("configured")
         emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId, "requestId" to immediate.optString("request_id")))
@@ -115,7 +119,8 @@ class ChallengeAppBridge(
             .put("configured", true)
             .put("source_id", normalizedSourceId)
             .put("server_timezone", "UTC")
-            .put("foreground_loop_seconds", 300)
+            .put("foreground_loop_min_seconds", 90)
+            .put("foreground_loop_max_seconds", 180)
             .put("immediate_sync_queued", true)
             .put("request_id", immediate.optString("request_id"))
             .toString()
@@ -264,6 +269,7 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
+        HealthSyncWorker.enqueueImmediate(context)
         foregroundSyncEngine.onAppForeground("app_resume")
         emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to true))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)

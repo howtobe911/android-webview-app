@@ -24,6 +24,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 class HealthSyncWorker(
     appContext: Context,
@@ -235,6 +236,7 @@ class HealthSyncWorker(
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
             val request = PeriodicWorkRequestBuilder<HealthSyncWorker>(15, TimeUnit.MINUTES)
+                .setInitialDelay(Random.nextLong(0, 15), TimeUnit.MINUTES)
                 .setConstraints(constraints)
                 .build()
             WorkManager.getInstance(context.applicationContext)

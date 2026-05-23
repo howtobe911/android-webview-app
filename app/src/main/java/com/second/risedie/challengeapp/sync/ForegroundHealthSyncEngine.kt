@@ -22,9 +22,9 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import kotlin.random.Random
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -61,18 +61,10 @@ class ForegroundHealthSyncEngine(
     fun onAppForeground(reason: String = "app_resume") {
         foreground = true
         startForegroundLoop()
-        val last = lastSuccessfulSyncAt()
-        val now = Instant.now()
-        if (last == null || Duration.between(last, now).seconds >= RESUME_COOLDOWN_SECONDS) {
-            requestForegroundSync(reason)
-        } else {
-            emit(JSONObject()
-                .put("type", "skipped_recent")
-                .put("reason", reason)
-                .put("fresh", true)
-                .put("last_successful_foreground_sync_at", last.toString())
-                .put("synced_at", now.toString()))
-        }
+        // App launch/resume is a hard sync trigger. Do not short-circuit with
+        // skipped_recent: Health Connect providers may publish fresher aggregates
+        // exactly when the WebView returns to foreground.
+        requestForegroundSync(reason)
     }
 
     fun onAppBackground() {
@@ -86,7 +78,7 @@ class ForegroundHealthSyncEngine(
         foreground = true
         loopJob = scope.launch {
             while (isActive && foreground) {
-                delay(FOREGROUND_LOOP_INTERVAL_MS)
+                delay(nextForegroundLoopDelayMs())
                 if (!foreground) break
                 if (mutex.isLocked) {
                     emit(JSONObject().put("type", "skipped_already_running").put("reason", "foreground_loop").put("synced_at", Instant.now().toString()))
@@ -96,6 +88,11 @@ class ForegroundHealthSyncEngine(
             }
         }
     }
+
+    private fun nextForegroundLoopDelayMs(): Long = Random.nextLong(
+        FOREGROUND_LOOP_INTERVAL_MIN_MS,
+        FOREGROUND_LOOP_INTERVAL_MAX_MS + 1,
+    )
 
     suspend fun syncNowForeground(reason: String, requestId: String = UUID.randomUUID().toString()): JSONObject {
         return mutex.withLock {
@@ -297,8 +294,8 @@ class ForegroundHealthSyncEngine(
         private const val KEY_SOURCE_ID = "source_id"
         private const val KEY_LAST_SUCCESS = "last_successful_foreground_sync_at"
         private const val SYNC_TIMEOUT_MS = 25_000L
-        private const val RESUME_COOLDOWN_SECONDS = 45L
-        private const val FOREGROUND_LOOP_INTERVAL_MS = 300_000L
+        private const val FOREGROUND_LOOP_INTERVAL_MIN_MS = 90_000L
+        private const val FOREGROUND_LOOP_INTERVAL_MAX_MS = 180_000L
         private val WINDOW_KINDS = setOf("walk_steps_windows", "activity_windows", "activity_detail_windows")
         private val FINAL_WINDOW_KINDS = setOf("activity_detail_windows")
     }
