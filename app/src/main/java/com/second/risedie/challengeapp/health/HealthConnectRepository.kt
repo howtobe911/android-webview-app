@@ -254,6 +254,62 @@ class HealthConnectRepository(private val context: Context) {
             }
     }
 
+
+
+    suspend fun buildDayCloseSnapshotPayload(
+        activityDate: LocalDate,
+        includeRunDistance: Boolean = true,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        val client = clientOrNull() ?: return@withContext emptyPayload("Health Connect недоступен.")
+        if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
+
+        val generatedAt = Instant.now()
+        val windowFromUtc = activityDate.atStartOfDay(ZoneId.of("UTC")).toInstant()
+        val windowToUtc = activityDate.plusDays(1).atStartOfDay(ZoneId.of("UTC")).toInstant().minusSeconds(1)
+        if (!windowToUtc.isBefore(generatedAt)) {
+            return@withContext emptyPayload("UTC-день ещё не закрыт.")
+        }
+
+        val warnings = JSONArray()
+        val walkSteps = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        val runMeters = if (includeRunDistance) {
+            try {
+                calculateRunningDistanceMeters(client, windowFromUtc, windowToUtc)
+            } catch (error: Throwable) {
+                warnings.put("distance: ${error.message ?: error.javaClass.simpleName}")
+                0.0
+            }
+        } else {
+            0.0
+        }
+        val runSeconds = try {
+            calculateRunningDurationSeconds(client, windowFromUtc, windowToUtc)
+        } catch (error: Throwable) {
+            warnings.put("duration: ${error.message ?: error.javaClass.simpleName}")
+            0L
+        }
+        val normalizedRunMeters = String.format(Locale.US, "%.2f", runMeters).toDouble()
+        val sourceHash = listOf(
+            "day-close", activityDate.toString(), windowFromUtc.toString(), windowToUtc.toString(), walkSteps.toString(), normalizedRunMeters.toLong().toString(), runSeconds.toString()
+        ).joinToString("|").hashCode().toString()
+
+        JSONObject()
+            .put("activity_date", activityDate.toString())
+            .put("window_from_utc", windowFromUtc.toString())
+            .put("window_to_utc", windowToUtc.toString())
+            .put("walk_steps", walkSteps)
+            .put("run_meters", normalizedRunMeters.toLong())
+            .put("run_seconds", runSeconds)
+            .put("source_hash", sourceHash)
+            .put("external_batch_id", uniqueBatchId("android-day-close-${activityDate}", generatedAt))
+            .put("generated_at", generatedAt.toString())
+            .put("preferred_source", "health_connect")
+            .put("source_of_truth", "health_connect_day_close_snapshot")
+            .apply {
+                if (warnings.length() > 0) put("warnings", warnings)
+            }
+    }
+
     private fun emptyPayload(message: String): JSONObject = JSONObject()
         .put("batches", JSONArray())
         .put("generated_at", Instant.now().toString())

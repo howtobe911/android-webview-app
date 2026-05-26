@@ -24,6 +24,7 @@ import javax.crypto.spec.SecretKeySpec
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
+import java.time.LocalDate
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
@@ -43,8 +44,10 @@ class HealthSyncWorker(
             if (!repository.hasPermissions()) return@withContext Result.success()
 
             val syncWindow = fetchSyncWindow(apiBase, token)
+            postPreviousDayCloseSnapshotIfNeeded(apiBase, token, sourceId, repository, syncWindow)
+
             val payload = repository.buildFreshServerWindowSyncPayload(serverWindow = syncWindow, includeRunDistance = true)
-            applyNativeMaxForServerWindowSteps(payload, syncWindow, liveStepTracker)
+            keepHealthConnectAuthoritative(payload, syncWindow, liveStepTracker)
             val batches = payload.optJSONArray("batches") ?: return@withContext Result.success()
             if (batches.length() == 0) return@withContext Result.success()
 
@@ -86,32 +89,28 @@ class HealthSyncWorker(
     }
 
 
-    private fun applyNativeMaxForServerWindowSteps(payload: JSONObject, syncWindow: ServerSyncWindow, liveStepTracker: LiveStepTracker) {
-        val batches = payload.optJSONArray("batches") ?: return
-        for (batchIndex in 0 until batches.length()) {
-            val batch = batches.optJSONObject(batchIndex) ?: continue
-            if (batch.optString("kind") != "walk_steps") continue
-            val records = batch.optJSONArray("records") ?: continue
-            for (recordIndex in 0 until records.length()) {
-                val record = records.optJSONObject(recordIndex) ?: continue
-                if (record.optString("activity_type") != "walk" || record.optString("metric_type") != "steps") continue
+    private suspend fun postPreviousDayCloseSnapshotIfNeeded(
+        apiBase: String,
+        token: String,
+        sourceId: Long,
+        repository: HealthConnectRepository,
+        syncWindow: ServerSyncWindow,
+    ) {
+        val previousDay = LocalDate.parse(syncWindow.serverDay).minusDays(1)
+        val payload = repository.buildDayCloseSnapshotPayload(previousDay, includeRunDistance = true)
+        if (payload.optString("activity_date").isBlank()) return
 
-                val healthSteps = record.optLong("value", 0L).coerceAtLeast(0L)
-                val nativeSteps = liveStepTracker.serverWindowStepsSnapshot(syncWindow, healthSteps)
-                val finalSteps = maxOf(healthSteps, nativeSteps)
-
-                record.put("value", finalSteps)
-                record.put("health_connect_value", healthSteps)
-                record.put("native_step_counter_value", nativeSteps)
-                record.put("source_of_truth", "max_native_step_counter_health_connect")
-                batch.put("source_of_truth", "max_native_step_counter_health_connect")
-                batch.put("health_connect_value", healthSteps)
-                batch.put("native_step_counter_value", nativeSteps)
-                batch.put("max_value", finalSteps)
-                payload.put("preferred_source", "max_native_step_counter_health_connect")
-                return
-            }
+        val body = JSONObject(payload.toString())
+            .put("source_id", sourceId)
+        runCatching {
+            postJson("$apiBase/api/v1/me/activity/health-connect/day-close-sync", token, body)
         }
+    }
+
+    private fun keepHealthConnectAuthoritative(payload: JSONObject, syncWindow: ServerSyncWindow, liveStepTracker: LiveStepTracker) {
+        // Health Connect remains the only authoritative server sync value.
+        // Native counter is used only by the live/pending layer and is never merged into this payload.
+        payload.put("preferred_source", "health_connect")
     }
 
 

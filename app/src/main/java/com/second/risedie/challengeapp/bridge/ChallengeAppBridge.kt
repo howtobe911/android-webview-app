@@ -297,7 +297,7 @@ class ChallengeAppBridge(
                         .put("message", "Серверное окно активности ещё не получено.")
                         .toString()
                 val payload = withTimeout(8_000) { healthRepository.buildFreshServerWindowSyncPayload(serverWindow = serverWindow, includeRunDistance = false) }
-                applyNativeMaxForServerWindowSteps(payload, serverWindow)
+                keepHealthConnectAuthoritative(payload, serverWindow)
                 val result = payload.toString()
                 logDebug("sync:getActivitySyncPayload:done", mapOf("payload" to result))
                 result
@@ -348,32 +348,10 @@ class ChallengeAppBridge(
     }
 
 
-    private fun applyNativeMaxForServerWindowSteps(payload: JSONObject, serverWindow: ServerSyncWindow) {
-        val batches = payload.optJSONArray("batches") ?: return
-        for (batchIndex in 0 until batches.length()) {
-            val batch = batches.optJSONObject(batchIndex) ?: continue
-            if (batch.optString("kind") != "walk_steps") continue
-            val records = batch.optJSONArray("records") ?: continue
-            for (recordIndex in 0 until records.length()) {
-                val record = records.optJSONObject(recordIndex) ?: continue
-                if (record.optString("activity_type") != "walk" || record.optString("metric_type") != "steps") continue
-
-                val healthSteps = record.optLong("value", 0L).coerceAtLeast(0L)
-                val nativeSteps = liveStepTracker.serverWindowStepsSnapshot(serverWindow, healthSteps)
-                val finalSteps = maxOf(healthSteps, nativeSteps)
-
-                record.put("value", finalSteps)
-                record.put("health_connect_value", healthSteps)
-                record.put("native_step_counter_value", nativeSteps)
-                record.put("source_of_truth", "max_native_step_counter_health_connect")
-                batch.put("source_of_truth", "max_native_step_counter_health_connect")
-                batch.put("health_connect_value", healthSteps)
-                batch.put("native_step_counter_value", nativeSteps)
-                batch.put("max_value", finalSteps)
-                payload.put("preferred_source", "max_native_step_counter_health_connect")
-                return
-            }
-        }
+    private fun keepHealthConnectAuthoritative(payload: JSONObject, serverWindow: ServerSyncWindow) {
+        // Health Connect remains the only authoritative server sync value.
+        // Native counter is used only by the live/pending layer and is never merged into this payload.
+        payload.put("preferred_source", "health_connect")
     }
 
 
