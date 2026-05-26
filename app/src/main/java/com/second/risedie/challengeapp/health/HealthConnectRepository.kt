@@ -505,3 +505,5 @@ class HealthConnectRepository(private val context: Context) {
         const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"
     }
 }
+
+private suspend fun calculateRunningDurationSeconds(client: HealthConnectClient, fromUtc: Instant, toUtc: Instant): Long = 0L

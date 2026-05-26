@@ -6,6 +6,6 @@
         <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
         <item name="android:windowSplashScreenBackground">@color/splash_background</item>
         <item name="android:windowSplashScreenAnimatedIcon">@drawable/challenge_app_icon_from_server</item>
-        <item name="android:postSplashScreenTheme">@style/Theme.GraFit</item>
+        <item name="postSplashScreenTheme">@style/Theme.GraFit</item>
     </style>
 </resources>
