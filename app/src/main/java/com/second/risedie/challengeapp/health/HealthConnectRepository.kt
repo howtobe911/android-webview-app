@@ -166,36 +166,41 @@ class HealthConnectRepository(private val context: Context) {
             buildActivityWindowsBatch(client, day.minusDays(1), now)?.let { batches.put(it) }
         }
         // Server-window aggregate is always requested by the backend-issued UTC window.
-        // Zero is sent with HC read evidence; backend rejects empty-window zero over an existing truth.
-        batches.put(
-            JSONObject()
-                    .put("kind", "walk_steps")
-                    .put("external_batch_id", uniqueBatchId("android-steps-serverday-${effectiveWindow.serverDay}", now))
-                    .put("generated_at", now.toString())
-                    .put("device_time", now.toString())
-                    .put("server_timezone", effectiveWindow.serverTimezone)
-                    .put("window_from_utc", windowFromUtc.toString())
-                    .put("window_to_utc", windowToUtc.toString())
-                    .put("server_day_ends_at_utc", effectiveWindow.serverDayEndsAtUtc.toString())
-                    .put(
-                        "records",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("activity_type", "walk")
-                                .put("metric_type", "steps")
-                                .put("value", stepsTotal)
-                                .put("health_connect_records_seen", stepsRead.recordsSeen)
-                                .put("health_connect_aggregate_seen", stepsRead.aggregateSeen)
-                                .put("recorded_from", windowFromUtc.toString())
-                                .put("recorded_to", windowToUtc.toString())
-                                .put("window_from_utc", windowFromUtc.toString())
-                                .put("window_to_utc", windowToUtc.toString())
-                                .put("server_timezone", effectiveWindow.serverTimezone)
-                                .put("client_generated_at", now.toString())
-                                .put("device_time", now.toString())
-                                    )
-                    )
-        )
+        // Empty-window zero from Health Connect is not authoritative and must not be sent as a normal batch.
+        val hasAuthoritativeSteps = stepsTotal > 0L || stepsRead.recordsSeen > 0 || stepsRead.aggregateSeen
+        if (hasAuthoritativeSteps) {
+            batches.put(
+                JSONObject()
+                        .put("kind", "walk_steps")
+                        .put("external_batch_id", uniqueBatchId("android-steps-serverday-${effectiveWindow.serverDay}", now))
+                        .put("generated_at", now.toString())
+                        .put("device_time", now.toString())
+                        .put("server_timezone", effectiveWindow.serverTimezone)
+                        .put("window_from_utc", windowFromUtc.toString())
+                        .put("window_to_utc", windowToUtc.toString())
+                        .put("server_day_ends_at_utc", effectiveWindow.serverDayEndsAtUtc.toString())
+                        .put(
+                            "records",
+                            JSONArray().put(
+                                JSONObject()
+                                    .put("activity_type", "walk")
+                                    .put("metric_type", "steps")
+                                    .put("value", stepsTotal)
+                                    .put("health_connect_records_seen", stepsRead.recordsSeen)
+                                    .put("health_connect_aggregate_seen", stepsRead.aggregateSeen)
+                                    .put("recorded_from", windowFromUtc.toString())
+                                    .put("recorded_to", windowToUtc.toString())
+                                    .put("window_from_utc", windowFromUtc.toString())
+                                    .put("window_to_utc", windowToUtc.toString())
+                                    .put("server_timezone", effectiveWindow.serverTimezone)
+                                    .put("client_generated_at", now.toString())
+                                    .put("device_time", now.toString())
+                                        )
+                        )
+            )
+        } else {
+            warnings.put("steps_empty_window_zero_suppressed")
+        }
 
         if (distanceMeters > 0.0) {
             val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()

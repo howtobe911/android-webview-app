@@ -14,7 +14,6 @@ import androidx.health.connect.client.PermissionController
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
-import com.second.risedie.challengeapp.health.ServerSyncWindow
 import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import kotlinx.coroutines.CoroutineScope
@@ -22,17 +21,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -110,7 +103,6 @@ class ChallengeAppBridge(
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
-        HealthSyncWorker.enqueueImmediate(context)
         foregroundSyncEngine.startForegroundLoop()
         val immediate = foregroundSyncEngine.requestForegroundSync("configured")
         emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId, "requestId" to immediate.optString("request_id")))
@@ -248,7 +240,8 @@ class ChallengeAppBridge(
 
     fun onPermissionsFlowFinished() {
         permissionFlowInProgress.set(false)
-        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)
+        foregroundSyncEngine.requestForegroundSync("permission_granted")
+        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
     }
 
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
@@ -269,10 +262,9 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        HealthSyncWorker.enqueueImmediate(context)
         foregroundSyncEngine.onAppForeground("app_resume")
         emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to true))
-        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true)
+        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
     }
 
     fun onHostStopped() {
@@ -284,76 +276,6 @@ class ChallengeAppBridge(
         foregroundSyncEngine.onAppBackground()
         bridgeScope.cancel()
     }
-
-    @JavascriptInterface
-    fun getActivitySyncPayload(): String {
-        return runBlocking {
-            try {
-                val serverWindow = configuredSyncWindow()
-                    ?: return@runBlocking JSONObject()
-                        .put("batches", JSONArray())
-                        .put("generated_at", Instant.now().toString())
-                        .put("preferred_source", "health_connect")
-                        .put("message", "Серверное окно активности ещё не получено.")
-                        .toString()
-                val payload = withTimeout(8_000) { healthRepository.buildFreshServerWindowSyncPayload(serverWindow = serverWindow, includeRunDistance = false) }
-                keepHealthConnectAuthoritative(payload, serverWindow)
-                val result = payload.toString()
-                logDebug("sync:getActivitySyncPayload:done", mapOf("payload" to result))
-                result
-            } catch (error: Throwable) {
-                logError("sync:getActivitySyncPayload:error", error)
-                JSONObject()
-                    .put("batches", JSONArray())
-                    .put("generated_at", Instant.now().toString())
-                    .put("preferred_source", "health_connect")
-                    .put("message", error.message ?: "Не удалось прочитать Health Connect.")
-                    .toString()
-            }
-        }
-    }
-
-    private suspend fun configuredSyncWindow(): ServerSyncWindow? = withContext(Dispatchers.IO) {
-        val prefs = context.getSharedPreferences("grafit_native_health_sync", Context.MODE_PRIVATE)
-        val token = prefs.getString("auth_token", null)?.takeIf { it.isNotBlank() } ?: return@withContext null
-        val apiBase = prefs.getString("api_base", null)?.trimEnd('/')?.takeIf { it.startsWith("https://") } ?: return@withContext null
-
-        val connection = (URL("$apiBase/api/v1/me/activity/sync-window").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 10_000
-            readTimeout = 20_000
-            setRequestProperty("Accept", "application/json")
-            setRequestProperty("Authorization", "Bearer $token")
-        }
-
-        try {
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val text = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
-            if (code !in 200..299) return@withContext null
-            val response = JSONObject(text)
-            val data = response.optJSONObject("data") ?: response
-            ServerSyncWindow(
-                serverDay = data.optString("server_day"),
-                serverTimezone = data.optString("server_timezone", "UTC"),
-                windowFromUtc = Instant.parse(data.optString("window_from_utc")),
-                windowToUtc = Instant.parse(data.optString("window_to_utc")),
-                serverDayEndsAtUtc = Instant.parse(data.optString("server_day_ends_at_utc")),
-            )
-        } catch (_: Throwable) {
-            null
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-
-    private fun keepHealthConnectAuthoritative(payload: JSONObject, serverWindow: ServerSyncWindow) {
-        // Health Connect remains the only authoritative server sync value.
-        // Native counter is used only by the live/pending layer and is never merged into this payload.
-        payload.put("preferred_source", "health_connect")
-    }
-
 
     @JavascriptInterface
     fun getLiveActivitySnapshot(): String {

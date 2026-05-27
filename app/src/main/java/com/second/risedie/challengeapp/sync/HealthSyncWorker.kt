@@ -47,7 +47,12 @@ class HealthSyncWorker(
             require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
             postPreviousDayCloseSnapshotIfNeeded(apiBase, token, sourceId, repository, syncWindow)
 
-            val payload = repository.buildFreshServerWindowSyncPayload(serverWindow = syncWindow, includeRunDistance = true)
+            val payload = repository.buildFreshServerWindowSyncPayload(
+                serverWindow = syncWindow,
+                includeRunDistance = true,
+                attempts = 8,
+                delayMillis = 750L,
+            )
             keepHealthConnectAuthoritative(payload, syncWindow, liveStepTracker)
             val batches = payload.optJSONArray("batches") ?: return@withContext Result.success()
             if (batches.length() == 0) return@withContext Result.success()
