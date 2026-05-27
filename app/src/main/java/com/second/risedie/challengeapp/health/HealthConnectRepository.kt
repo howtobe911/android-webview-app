@@ -17,7 +17,6 @@ import org.json.JSONObject
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
-import java.time.ZoneId
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.max
@@ -146,7 +145,8 @@ class HealthConnectRepository(private val context: Context) {
         val windowToUtc = if (effectiveWindow.windowToUtc.isAfter(now)) now else effectiveWindow.windowToUtc
         val warnings = JSONArray()
 
-        val stepsTotal = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        val stepsRead = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        val stepsTotal = stepsRead.total
 
         val distanceMeters = if (includeRunDistance) {
             try {
@@ -163,19 +163,16 @@ class HealthConnectRepository(private val context: Context) {
 
 
         if (includeClosedDayWindows) {
-            buildActivityWindowsBatch(client, day.minusDays(1), ZoneId.of(effectiveWindow.serverTimezone), now)?.let { batches.put(it) }
+            buildActivityWindowsBatch(client, day.minusDays(1), now)?.let { batches.put(it) }
         }
-        // Server-window aggregate: even 0 is a valid confirmed result for the current UTC day.
-        // Do not skip the batch when Health Connect returns zero; backend must receive
-        // and persist the authoritative activity_current_state for this server window.
+        // Server-window aggregate is always requested by the backend-issued UTC window.
+        // Zero is sent with HC read evidence; backend rejects empty-window zero over an existing truth.
         batches.put(
             JSONObject()
                     .put("kind", "walk_steps")
                     .put("external_batch_id", uniqueBatchId("android-steps-serverday-${effectiveWindow.serverDay}", now))
                     .put("generated_at", now.toString())
                     .put("device_time", now.toString())
-                    .put("source_day", effectiveWindow.serverDay)
-                    .put("timezone", "UTC")
                     .put("server_timezone", effectiveWindow.serverTimezone)
                     .put("window_from_utc", windowFromUtc.toString())
                     .put("window_to_utc", windowToUtc.toString())
@@ -187,17 +184,16 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("activity_type", "walk")
                                 .put("metric_type", "steps")
                                 .put("value", stepsTotal)
+                                .put("health_connect_records_seen", stepsRead.recordsSeen)
+                                .put("health_connect_aggregate_seen", stepsRead.aggregateSeen)
                                 .put("recorded_from", windowFromUtc.toString())
                                 .put("recorded_to", windowToUtc.toString())
                                 .put("window_from_utc", windowFromUtc.toString())
                                 .put("window_to_utc", windowToUtc.toString())
                                 .put("server_timezone", effectiveWindow.serverTimezone)
-                                .put("source_day_role", "metadata_only")
                                 .put("client_generated_at", now.toString())
                                 .put("device_time", now.toString())
-                                .put("source_day", effectiveWindow.serverDay)
-                                .put("client_timezone", "UTC")
-                        )
+                                    )
                     )
         )
 
@@ -209,8 +205,6 @@ class HealthConnectRepository(private val context: Context) {
                     .put("external_batch_id", uniqueBatchId("android-distance-serverday-${effectiveWindow.serverDay}", now))
                     .put("generated_at", now.toString())
                     .put("device_time", now.toString())
-                    .put("source_day", effectiveWindow.serverDay)
-                    .put("timezone", "UTC")
                     .put("server_timezone", effectiveWindow.serverTimezone)
                     .put("window_from_utc", windowFromUtc.toString())
                     .put("window_to_utc", windowToUtc.toString())
@@ -227,12 +221,9 @@ class HealthConnectRepository(private val context: Context) {
                                 .put("window_from_utc", windowFromUtc.toString())
                                 .put("window_to_utc", windowToUtc.toString())
                                 .put("server_timezone", effectiveWindow.serverTimezone)
-                                .put("source_day_role", "metadata_only")
                                 .put("client_generated_at", now.toString())
                                 .put("device_time", now.toString())
-                                .put("source_day", effectiveWindow.serverDay)
-                                .put("client_timezone", "UTC")
-                        )
+                                    )
                     )
             )
         }
@@ -240,8 +231,6 @@ class HealthConnectRepository(private val context: Context) {
         JSONObject()
             .put("batches", batches)
             .put("generated_at", now.toString())
-            .put("source_day", effectiveWindow.serverDay)
-            .put("timezone", "UTC")
             .put("server_timezone", effectiveWindow.serverTimezone)
             .put("window_from_utc", windowFromUtc.toString())
             .put("window_to_utc", windowToUtc.toString())
@@ -264,14 +253,15 @@ class HealthConnectRepository(private val context: Context) {
         if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
 
         val generatedAt = Instant.now()
-        val windowFromUtc = activityDate.atStartOfDay(ZoneId.of("UTC")).toInstant()
-        val windowToUtc = activityDate.plusDays(1).atStartOfDay(ZoneId.of("UTC")).toInstant().minusSeconds(1)
+        val windowFromUtc = Instant.parse("${activityDate}T00:00:00Z")
+        val windowToUtc = Instant.parse("${activityDate.plusDays(1)}T00:00:00Z").minusSeconds(1)
         if (!windowToUtc.isBefore(generatedAt)) {
             return@withContext emptyPayload("UTC-день ещё не закрыт.")
         }
 
         val warnings = JSONArray()
-        val walkSteps = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        val stepsRead = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        val walkSteps = stepsRead.total
         val runMeters = if (includeRunDistance) {
             try {
                 calculateRunningDistanceMeters(client, windowFromUtc, windowToUtc)
@@ -317,51 +307,60 @@ class HealthConnectRepository(private val context: Context) {
         .put("provider", providerPayload())
         .put("message", message)
 
+    private data class StepsReadResult(
+        val total: Long,
+        val aggregateSeen: Boolean,
+        val recordsSeen: Int,
+    )
+
     private suspend fun readStepsTotal(
         client: HealthConnectClient,
         from: Instant,
         to: Instant,
         warnings: JSONArray,
-    ): Long {
+    ): StepsReadResult {
         val aggregateTotal = try {
             client.aggregate(
                 AggregateRequest(
                     metrics = setOf(StepsRecord.COUNT_TOTAL),
                     timeRangeFilter = TimeRangeFilter.between(from, to),
                 )
-            )[StepsRecord.COUNT_TOTAL] ?: 0L
+            )[StepsRecord.COUNT_TOTAL]
         } catch (error: Throwable) {
             warnings.put("steps_aggregate: ${error.message ?: error.javaClass.simpleName}")
-            0L
+            null
         }
 
-        if (aggregateTotal > 0L) return aggregateTotal
+        if ((aggregateTotal ?: 0L) > 0L) {
+            return StepsReadResult(aggregateTotal ?: 0L, aggregateSeen = true, recordsSeen = 0)
+        }
 
         return try {
-            client.readRecords(
+            val records = client.readRecords(
                 ReadRecordsRequest(
                     recordType = StepsRecord::class,
                     timeRangeFilter = TimeRangeFilter.between(from, to),
                 )
-            ).records.sumOf { record ->
+            ).records
+            val total = records.sumOf { record ->
                 val overlapStart = maxInstant(from, record.startTime)
                 val overlapEnd = minInstant(to, record.endTime)
                 if (!overlapEnd.isAfter(overlapStart)) 0L else record.count
             }
+            StepsReadResult(total, aggregateSeen = aggregateTotal != null, recordsSeen = records.size)
         } catch (error: Throwable) {
             warnings.put("steps_records: ${error.message ?: error.javaClass.simpleName}")
-            0L
+            StepsReadResult(0L, aggregateSeen = aggregateTotal != null, recordsSeen = 0)
         }
     }
 
     private suspend fun buildActivityWindowsBatch(
         client: HealthConnectClient,
         sourceDay: LocalDate,
-        zoneId: ZoneId,
         generatedAt: Instant,
     ): JSONObject? {
-        val startOfDay = sourceDay.atStartOfDay(zoneId).toInstant()
-        val endOfDay = sourceDay.plusDays(1).atStartOfDay(zoneId).toInstant()
+        val startOfDay = Instant.parse("${sourceDay}T00:00:00Z")
+        val endOfDay = Instant.parse("${sourceDay.plusDays(1)}T00:00:00Z")
         if (!endOfDay.isBefore(generatedAt)) return null
 
         val windows = JSONArray()
@@ -398,7 +397,6 @@ class HealthConnectRepository(private val context: Context) {
                         .put("value", steps)
                         .put("recorded_from", windowStart.toString())
                         .put("recorded_to", windowEnd.toString())
-                        .put("source_day", sourceDay.toString())
                         .put("source_hash", "health-connect-steps-window-${sourceDay}-${windowStart.epochSecond}-$steps")
                 )
             }
@@ -431,7 +429,6 @@ class HealthConnectRepository(private val context: Context) {
                         .put("value", normalized)
                         .put("recorded_from", windowStart.toString())
                         .put("recorded_to", windowEnd.toString())
-                        .put("source_day", sourceDay.toString())
                         .put("source_hash", "health-connect-run-distance-window-${sourceDay}-${windowStart.epochSecond}-$normalized")
                 )
             }
@@ -444,7 +441,6 @@ class HealthConnectRepository(private val context: Context) {
                         .put("value", runDurationSeconds)
                         .put("recorded_from", windowStart.toString())
                         .put("recorded_to", windowEnd.toString())
-                        .put("source_day", sourceDay.toString())
                         .put("source_hash", "health-connect-run-duration-window-${sourceDay}-${windowStart.epochSecond}-$runDurationSeconds")
                 )
             }
@@ -458,8 +454,6 @@ class HealthConnectRepository(private val context: Context) {
             .put("external_batch_id", "health-connect-activity-windows-${sourceDay}")
             .put("generated_at", generatedAt.toString())
             .put("device_time", generatedAt.toString())
-            .put("source_day", sourceDay.toString())
-            .put("timezone", zoneId.id)
             .put("window_size_minutes", 15)
             .put("records", windows)
     }

@@ -44,6 +44,7 @@ class HealthSyncWorker(
             if (!repository.hasPermissions()) return@withContext Result.success()
 
             val syncWindow = fetchSyncWindow(apiBase, token)
+            require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
             postPreviousDayCloseSnapshotIfNeeded(apiBase, token, sourceId, repository, syncWindow)
 
             val payload = repository.buildFreshServerWindowSyncPayload(serverWindow = syncWindow, includeRunDistance = true)
@@ -61,13 +62,11 @@ class HealthSyncWorker(
                     .put("external_batch_id", batch.optString("external_batch_id"))
                     .put("generated_at", batch.optString("generated_at", payload.optString("generated_at")))
                     .put("device_time", batch.optString("device_time", payload.optString("device_time")))
-                    .put("source_day", batch.optString("source_day", payload.optString("source_day")))
-                    .put("timezone", batch.optString("timezone", payload.optString("timezone")))
-                    .put("server_timezone", syncWindow.serverTimezone)
+                    .put("server_day", syncWindow.serverDay)
+                    .put("server_timezone", "UTC")
                     .put("window_from_utc", syncWindow.windowFromUtc.toString())
                     .put("window_to_utc", syncWindow.windowToUtc.toString())
                     .put("server_day_ends_at_utc", syncWindow.serverDayEndsAtUtc.toString())
-                    .put("source_day_role", "metadata_only")
                     .put("records", batch.optJSONArray("records"))
                     .put("is_live_ui_only", false)
                     .put("source_of_truth", batch.optString("source_of_truth", "health_connect"))
