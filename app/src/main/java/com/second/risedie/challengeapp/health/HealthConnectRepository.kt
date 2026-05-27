@@ -504,6 +504,48 @@ class HealthConnectRepository(private val context: Context) {
     companion object {
         const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"
     }
-}
 
-private suspend fun calculateRunningDurationSeconds(client: HealthConnectClient, fromUtc: Instant, toUtc: Instant): Long = 0L
+    private suspend fun calculateRunningDurationSeconds(
+        client: HealthConnectClient,
+        fromUtc: Instant,
+        toUtc: Instant,
+    ): Long {
+        if (!toUtc.isAfter(fromUtc)) return 0L
+
+        val sessions = client.readRecords(
+            ReadRecordsRequest(
+                recordType = ExerciseSessionRecord::class,
+                timeRangeFilter = TimeRangeFilter.between(fromUtc, toUtc),
+            )
+        ).records
+            .asSequence()
+            .filter { it.exerciseType == ExerciseSessionRecord.EXERCISE_TYPE_RUNNING }
+            .mapNotNull { session ->
+                val clippedFrom = maxInstant(fromUtc, session.startTime)
+                val clippedTo = minInstant(toUtc, session.endTime)
+                if (clippedTo.isAfter(clippedFrom)) Pair(clippedFrom, clippedTo) else null
+            }
+            .sortedBy { it.first }
+            .toList()
+
+        if (sessions.isEmpty()) return 0L
+
+        var totalSeconds = 0L
+        var mergedStart = sessions.first().first
+        var mergedEnd = sessions.first().second
+
+        for ((start, end) in sessions.drop(1)) {
+            if (!start.isAfter(mergedEnd)) {
+                if (end.isAfter(mergedEnd)) mergedEnd = end
+            } else {
+                totalSeconds += Duration.between(mergedStart, mergedEnd).seconds
+                mergedStart = start
+                mergedEnd = end
+            }
+        }
+
+        totalSeconds += Duration.between(mergedStart, mergedEnd).seconds
+        return max(0L, totalSeconds)
+    }
+
+}
