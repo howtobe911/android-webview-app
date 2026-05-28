@@ -187,15 +187,17 @@ class LiveStepTracker(context: Context) : SensorEventListener {
                 val counterDelta = if (currentRaw > 0f) max(0f, currentRaw - base).toLong() else previous.realtimeDeltaSteps
                 val realtimeDelta = max(previous.realtimeDeltaSteps, counterDelta)
 
-                // Native candidate is the old trusted anchor plus the native delta.
-                // Health Connect candidate is the aggregate for the same UTC server window.
-                // Use max(), never health + delta, otherwise HC catch-up double-counts steps.
-                val nativeCandidate = max(previous.serverVerifiedSteps, previous.displaySteps)
-                val nextDisplay = max(safeHealthSteps, max(nativeCandidate, previous.serverVerifiedSteps + realtimeDelta))
+                // Server truth is the only trusted anchor. Never carry previous.displaySteps
+                // into a new server-window snapshot: displaySteps is a volatile UI cache and may
+                // contain stale optimistic/native overlay from before the server truth arrived.
+                // The live value can only be rebuilt as: server truth + native delta observed
+                // after the current sensorBaseValue.
+                val trustedServerSteps = max(previous.serverVerifiedSteps, safeHealthSteps)
+                val nextDisplay = max(safeHealthSteps, trustedServerSteps + realtimeDelta)
 
                 previous.copy(
                     activityDate = serverDay,
-                    serverVerifiedSteps = max(previous.serverVerifiedSteps, safeHealthSteps),
+                    serverVerifiedSteps = trustedServerSteps,
                     sensorBaseValue = base,
                     sensorLastValue = if (currentRaw > 0f) currentRaw else previous.sensorLastValue,
                     realtimeDeltaSteps = realtimeDelta,
