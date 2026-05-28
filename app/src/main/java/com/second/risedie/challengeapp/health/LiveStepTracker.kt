@@ -72,33 +72,10 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     fun reconcileAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
-        val serverDay = activityDate.trim()
-        if (serverDay.isBlank()) return
-
-        val now = Instant.now()
-        synchronized(stateLock) {
-            val previous = cachedState ?: runBlocking { overlayStore.read() }
-            val currentRaw = rawCounter ?: previous.sensorLastValue
-            val safeSteps = max(0L, serverSteps)
-            val sameServerDay = previous.activityDate == serverDay
-            val optimisticDelta = if (sameServerDay) {
-                max(0L, previous.displaySteps - safeSteps)
-            } else {
-                0L
-            }
-
-            cachedState = LiveActivityOverlayState(
-                activityDate = serverDay,
-                serverVerifiedSteps = safeSteps,
-                sensorBaseValue = currentRaw,
-                sensorLastValue = currentRaw,
-                realtimeDeltaSteps = optimisticDelta,
-                displaySteps = safeSteps + optimisticDelta,
-                lastHealthConnectReadAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now,
-                updatedAt = now,
-            )
-        }
-        persistCurrentThrottled(force = true)
+        // Kept for binary/source compatibility with older bridge calls.
+        // Reconciliation used to preserve the old optimistic display delta; for server truth
+        // this is wrong. A server-truth anchor must always be a hard reset.
+        resetAnchorFromServer(activityDate, serverSteps, serverRecordedAt)
     }
 
     fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {

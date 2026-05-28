@@ -126,7 +126,7 @@ class ChallengeAppBridge(
         val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
         liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
         return JSONObject()
-            .put("reconciled", true)
+            .put("reset", true)
             .put("activity_date", day)
             .put("server_steps", steps)
             .toString()
