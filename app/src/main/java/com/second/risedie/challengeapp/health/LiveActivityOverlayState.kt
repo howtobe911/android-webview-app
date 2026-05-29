@@ -12,6 +12,7 @@ data class LiveActivityOverlayState(
     val sensorLastValue: Float = 0f,
     val realtimeDeltaSteps: Long = 0,
     val displaySteps: Long = 0,
+    val awaitingFreshBaseline: Boolean = false,
     val lastHealthConnectReadAt: Instant? = null,
     val updatedAt: Instant = Instant.now(),
 )

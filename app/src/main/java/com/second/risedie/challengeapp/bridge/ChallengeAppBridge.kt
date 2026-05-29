@@ -124,9 +124,10 @@ class ChallengeAppBridge(
     fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {
         val day = activityDate?.trim().orEmpty()
         val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
-        liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
+        val action = liveStepTracker.resetAnchorFromServer(day, steps, recordedAt?.trim()?.takeIf { it.isNotBlank() })
         return JSONObject()
-            .put("reset", true)
+            .put("reset", action.startsWith("hard_reset"))
+            .put("action", action)
             .put("activity_date", day)
             .put("server_steps", steps)
             .toString()

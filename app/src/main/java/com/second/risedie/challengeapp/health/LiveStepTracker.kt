@@ -72,44 +72,81 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     fun reconcileAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
-        // Kept for binary/source compatibility with older bridge calls.
-        // Reconciliation used to preserve the old optimistic display delta; for server truth
-        // this is wrong. A server-truth anchor must always be a hard reset.
-        resetAnchorFromServer(activityDate, serverSteps, serverRecordedAt)
+        applyServerTruth(activityDate, serverSteps, serverRecordedAt)
     }
 
-    fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
+    fun resetAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?): String {
+        return applyServerTruth(activityDate, serverSteps, serverRecordedAt)
+    }
+
+    private fun applyServerTruth(activityDate: String, serverSteps: Long, serverRecordedAt: String?): String {
         val serverDay = activityDate.trim()
-        if (serverDay.isBlank()) return
+        if (serverDay.isBlank()) return "ignored_missing_server_day"
 
         val now = Instant.now()
-        synchronized(stateLock) {
-            val currentRaw = rawCounter
-            val safeSteps = max(0L, serverSteps)
+        val safeSteps = max(0L, serverSteps)
+        var action = "preserve_equal_truth"
 
-            // Hard server-truth reset.
-            //
-            // Do not use persisted/cached sensorLastValue as a fallback here.
-            // TYPE_STEP_COUNTER is a since-boot counter, and an old persisted value can belong
-            // to a stale live overlay. Reusing it as a new base resurrects the old delta:
-            // currentRaw(655) - staleBase(33) = 622, then serverTruth(549) + 622 = 1171.
-            //
-            // If Android has not delivered a fresh raw counter yet, keep the sensor base empty
-            // (0f). The first real counter event after this reset will become the new base and
-            // will not be counted as new steps.
-            cachedState = LiveActivityOverlayState(
-                activityDate = serverDay,
-                serverVerifiedSteps = safeSteps,
-                sensorBaseValue = currentRaw ?: 0f,
-                sensorLastValue = currentRaw ?: 0f,
-                realtimeDeltaSteps = 0L,
-                displaySteps = safeSteps,
-                lastHealthConnectReadAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now,
-                updatedAt = now,
-            )
+        synchronized(stateLock) {
+            val previous = cachedState ?: runBlocking { overlayStore.read() }
+            val previousDay = previous.activityDate.trim()
+            val previousTruth = max(0L, previous.serverVerifiedSteps)
+            val parsedRecordedAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now
+
+            val next = when {
+                previousDay != serverDay -> {
+                    action = "hard_reset_new_server_day"
+                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now)
+                }
+
+                safeSteps > previousTruth -> {
+                    action = "hard_reset_truth_increased"
+                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now)
+                }
+
+                safeSteps == previousTruth -> {
+                    action = "preserve_equal_truth"
+                    previous.copy(
+                        activityDate = serverDay,
+                        serverVerifiedSteps = safeSteps,
+                        lastHealthConnectReadAt = parsedRecordedAt,
+                        updatedAt = now,
+                    )
+                }
+
+                else -> {
+                    action = "preserve_downward_truth_warning"
+                    val preservedDisplay = max(previous.displaySteps, safeSteps + previous.realtimeDeltaSteps)
+                    val preservedDelta = max(previous.realtimeDeltaSteps, preservedDisplay - safeSteps)
+                    previous.copy(
+                        activityDate = serverDay,
+                        serverVerifiedSteps = safeSteps,
+                        realtimeDeltaSteps = preservedDelta,
+                        displaySteps = preservedDisplay,
+                        lastHealthConnectReadAt = parsedRecordedAt,
+                        updatedAt = now,
+                    )
+                }
+            }
+
+            cachedState = next
         }
         persistCurrentThrottled(force = true)
+        return action
     }
+
+    private fun hardResetState(serverDay: String, serverSteps: Long, recordedAt: Instant, now: Instant): LiveActivityOverlayState =
+        LiveActivityOverlayState(
+            activityDate = serverDay,
+            serverVerifiedSteps = serverSteps,
+            sensorBaseValue = 0f,
+            sensorLastValue = 0f,
+            realtimeDeltaSteps = 0L,
+            displaySteps = serverSteps,
+            awaitingFreshBaseline = true,
+            lastHealthConnectReadAt = recordedAt,
+            updatedAt = now,
+        )
 
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
@@ -150,6 +187,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("raw_counter_since_boot", raw?.toDouble() ?: JSONObject.NULL)
             .put("sensor_base_value", current.sensorBaseValue.toDouble())
             .put("realtime_delta_steps", current.realtimeDeltaSteps)
+            .put("awaiting_fresh_baseline", current.awaitingFreshBaseline)
             .put("updated_at", current.updatedAt.toString())
     }
 
@@ -174,76 +212,28 @@ class LiveStepTracker(context: Context) : SensorEventListener {
 
         synchronized(stateLock) {
             val previous = cachedState ?: runBlocking { overlayStore.read() }
-            val currentRaw = rawCounter
-            val hasFreshRaw = currentRaw != null && currentRaw > 0f
-            val serverTruthChanged = previous.activityDate == serverDay && previous.serverVerifiedSteps != safeHealthSteps
-
             val dayState = when {
-                previous.activityDate != serverDay -> {
-                    // New server day: start from server truth only. If a fresh raw counter is
-                    // already available, it becomes the base; otherwise wait for the first real
-                    // counter event. Never import previous.sensorLastValue from another day.
-                    LiveActivityOverlayState(
-                        activityDate = serverDay,
-                        serverVerifiedSteps = safeHealthSteps,
-                        sensorBaseValue = currentRaw ?: 0f,
-                        sensorLastValue = currentRaw ?: 0f,
-                        realtimeDeltaSteps = 0L,
-                        displaySteps = safeHealthSteps,
-                        lastHealthConnectReadAt = now,
-                        updatedAt = now,
-                    )
+                previous.activityDate != serverDay || safeHealthSteps > previous.serverVerifiedSteps -> {
+                    hardResetState(serverDay, safeHealthSteps, now, now)
                 }
 
-                !hasFreshRaw -> {
-                    // No fresh raw counter is available. Keep the overlay anchored strictly to
-                    // server truth and clear native delta/base. The next TYPE_STEP_COUNTER event
-                    // will establish the base instead of resurrecting persisted sensorLastValue.
+                safeHealthSteps == previous.serverVerifiedSteps -> {
                     previous.copy(
                         activityDate = serverDay,
                         serverVerifiedSteps = safeHealthSteps,
-                        sensorBaseValue = 0f,
-                        sensorLastValue = 0f,
-                        realtimeDeltaSteps = 0L,
-                        displaySteps = safeHealthSteps,
-                        lastHealthConnectReadAt = now,
-                        updatedAt = now,
-                    )
-                }
-
-                previous.sensorBaseValue <= 0f || serverTruthChanged -> {
-                    // First fresh counter after reset or after a new server truth. The current
-                    // raw value is a baseline, not a live delta.
-                    val rawValue = currentRaw!!
-                    previous.copy(
-                        activityDate = serverDay,
-                        serverVerifiedSteps = safeHealthSteps,
-                        sensorBaseValue = rawValue,
-                        sensorLastValue = rawValue,
-                        realtimeDeltaSteps = 0L,
-                        displaySteps = safeHealthSteps,
                         lastHealthConnectReadAt = now,
                         updatedAt = now,
                     )
                 }
 
                 else -> {
-                    val rawValue = currentRaw!!
-                    val base = when {
-                        rawValue < previous.sensorLastValue -> rawValue
-                        else -> previous.sensorBaseValue
-                    }
-                    val counterDelta = max(0f, rawValue - base).toLong()
-                    val realtimeDelta = max(previous.realtimeDeltaSteps, counterDelta)
-                    val nextDisplay = safeHealthSteps + realtimeDelta
-
+                    val preservedDisplay = max(previous.displaySteps, safeHealthSteps + previous.realtimeDeltaSteps)
+                    val preservedDelta = max(previous.realtimeDeltaSteps, preservedDisplay - safeHealthSteps)
                     previous.copy(
                         activityDate = serverDay,
                         serverVerifiedSteps = safeHealthSteps,
-                        sensorBaseValue = base,
-                        sensorLastValue = rawValue,
-                        realtimeDeltaSteps = realtimeDelta,
-                        displaySteps = nextDisplay,
+                        realtimeDeltaSteps = preservedDelta,
+                        displaySteps = preservedDisplay,
                         lastHealthConnectReadAt = now,
                         updatedAt = now,
                     )
@@ -282,6 +272,29 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             val dayKey = previous.activityDate
             val dayState = previous
 
+            if (dayState.awaitingFreshBaseline) {
+                if (raw == null) {
+                    cachedState = dayState.copy(
+                        activityDate = dayKey,
+                        realtimeDeltaSteps = 0L,
+                        displaySteps = dayState.serverVerifiedSteps,
+                        updatedAt = now,
+                    )
+                    return
+                }
+
+                cachedState = dayState.copy(
+                    activityDate = dayKey,
+                    sensorBaseValue = raw,
+                    sensorLastValue = raw,
+                    realtimeDeltaSteps = 0L,
+                    displaySteps = dayState.serverVerifiedSteps,
+                    awaitingFreshBaseline = false,
+                    updatedAt = now,
+                )
+                return
+            }
+
             val base = when {
                 raw == null -> dayState.sensorBaseValue
                 dayState.sensorBaseValue <= 0f -> raw
@@ -291,7 +304,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             val counterDelta = raw?.let { max(0f, it - base).toLong() } ?: dayState.realtimeDeltaSteps
             val detectorDelta = dayState.realtimeDeltaSteps + detectorPulse
             val realtimeDelta = max(counterDelta, detectorDelta)
-            val display = dayState.serverVerifiedSteps + realtimeDelta
+            val display = max(dayState.displaySteps, dayState.serverVerifiedSteps + realtimeDelta)
 
             cachedState = dayState.copy(
                 activityDate = dayKey,

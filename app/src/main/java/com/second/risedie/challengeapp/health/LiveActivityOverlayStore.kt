@@ -2,6 +2,7 @@ package com.second.risedie.challengeapp.health
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -24,6 +25,7 @@ class LiveActivityOverlayStore(private val context: Context) {
             sensorLastValue = data[SENSOR_LAST_VALUE] ?: 0f,
             realtimeDeltaSteps = data[REALTIME_DELTA_STEPS] ?: 0L,
             displaySteps = data[DISPLAY_STEPS] ?: 0L,
+            awaitingFreshBaseline = data[AWAITING_FRESH_BASELINE] ?: false,
             lastHealthConnectReadAt = data[LAST_HEALTH_CONNECT_READ_AT]?.let { Instant.parse(it) },
             updatedAt = data[UPDATED_AT]?.let { Instant.parse(it) } ?: Instant.now(),
         )
@@ -40,6 +42,7 @@ class LiveActivityOverlayStore(private val context: Context) {
             data[SENSOR_LAST_VALUE] = state.sensorLastValue
             data[REALTIME_DELTA_STEPS] = state.realtimeDeltaSteps
             data[DISPLAY_STEPS] = state.displaySteps
+            data[AWAITING_FRESH_BASELINE] = state.awaitingFreshBaseline
             state.lastHealthConnectReadAt?.let { data[LAST_HEALTH_CONNECT_READ_AT] = it.toString() }
             data[UPDATED_AT] = state.updatedAt.toString()
         }
@@ -55,6 +58,7 @@ class LiveActivityOverlayStore(private val context: Context) {
         private val SENSOR_LAST_VALUE = floatPreferencesKey("sensor_last_value")
         private val REALTIME_DELTA_STEPS = longPreferencesKey("realtime_delta_steps")
         private val DISPLAY_STEPS = longPreferencesKey("display_steps")
+        private val AWAITING_FRESH_BASELINE = booleanPreferencesKey("awaiting_fresh_baseline")
         private val LAST_HEALTH_CONNECT_READ_AT = stringPreferencesKey("last_health_connect_read_at")
         private val UPDATED_AT = stringPreferencesKey("updated_at")
     }
