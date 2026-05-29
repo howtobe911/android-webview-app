@@ -93,15 +93,16 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             val previousTruth = max(0L, previous.serverVerifiedSteps)
             val parsedRecordedAt = serverRecordedAt?.let { runCatching { Instant.parse(it) }.getOrNull() } ?: now
 
+            val rawBeforeServerTruth = rawCounter
             val next = when {
                 previousDay != serverDay -> {
                     action = "hard_reset_new_server_day"
-                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now)
+                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now, rawBeforeServerTruth)
                 }
 
                 safeSteps > previousTruth -> {
                     action = "hard_reset_truth_increased"
-                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now)
+                    hardResetState(serverDay, safeSteps, parsedRecordedAt, now, rawBeforeServerTruth)
                 }
 
                 safeSteps == previousTruth -> {
@@ -135,18 +136,20 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         return action
     }
 
-    private fun hardResetState(serverDay: String, serverSteps: Long, recordedAt: Instant, now: Instant): LiveActivityOverlayState =
-        LiveActivityOverlayState(
+    private fun hardResetState(serverDay: String, serverSteps: Long, recordedAt: Instant, now: Instant, rawBaseline: Float? = rawCounter): LiveActivityOverlayState {
+        val safeRawBaseline = rawBaseline?.takeIf { it >= 0f }
+        return LiveActivityOverlayState(
             activityDate = serverDay,
             serverVerifiedSteps = serverSteps,
-            sensorBaseValue = 0f,
-            sensorLastValue = 0f,
+            sensorBaseValue = safeRawBaseline ?: 0f,
+            sensorLastValue = safeRawBaseline ?: 0f,
             realtimeDeltaSteps = 0L,
             displaySteps = serverSteps,
-            awaitingFreshBaseline = true,
+            awaitingFreshBaseline = safeRawBaseline == null,
             lastHealthConnectReadAt = recordedAt,
             updatedAt = now,
         )
+    }
 
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
@@ -183,7 +186,10 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("is_live_ui_only", true)
             .put("source_of_truth", "native_live_ui")
             .put("available", true)
+            .put("source_day", current.activityDate)
+            .put("activity_date", current.activityDate)
             .put("steps_today", current.displaySteps)
+            .put("server_verified_steps", current.serverVerifiedSteps)
             .put("raw_counter_since_boot", raw?.toDouble() ?: JSONObject.NULL)
             .put("sensor_base_value", current.sensorBaseValue.toDouble())
             .put("realtime_delta_steps", current.realtimeDeltaSteps)
@@ -214,7 +220,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             val previous = cachedState ?: runBlocking { overlayStore.read() }
             val dayState = when {
                 previous.activityDate != serverDay || safeHealthSteps > previous.serverVerifiedSteps -> {
-                    hardResetState(serverDay, safeHealthSteps, now, now)
+                    hardResetState(serverDay, safeHealthSteps, now, now, freshRaw)
                 }
 
                 safeHealthSteps == previous.serverVerifiedSteps -> {
