@@ -68,6 +68,8 @@ class HealthSyncWorker(
                     .put("generated_at", batch.optString("generated_at", payload.optString("generated_at")))
                     .put("device_time", batch.optString("device_time", payload.optString("device_time")))
                     .put("server_day", syncWindow.serverDay)
+                    .put("activity_date", syncWindow.serverDay)
+                    .put("timezone", "UTC")
                     .put("server_timezone", "UTC")
                     .put("window_from_utc", syncWindow.windowFromUtc.toString())
                     .put("window_to_utc", syncWindow.windowToUtc.toString())
@@ -85,6 +87,8 @@ class HealthSyncWorker(
                 attachPayloadSecurityIfNeeded(apiBase, token, body)
                 postJson("$apiBase/api/v1/me/sources/sync", token, body)
             }
+
+            postPendingDetailRequests(apiBase, token, sourceId, repository, syncWindow)
 
             Result.success()
         } catch (_: Throwable) {
@@ -117,6 +121,44 @@ class HealthSyncWorker(
         payload.put("preferred_source", "health_connect")
     }
 
+
+
+    private suspend fun postPendingDetailRequests(
+        apiBase: String,
+        token: String,
+        sourceId: Long,
+        repository: HealthConnectRepository,
+        syncWindow: ServerSyncWindow,
+    ) {
+        val requests = fetchDetailRequests(apiBase, token, syncWindow.serverDay)
+        if (requests.length() == 0) return
+        val payload = repository.buildDetailWindowsPayload(requests)
+        val records = payload.optJSONArray("records") ?: JSONArray()
+        if (records.length() == 0) return
+
+        val body = JSONObject()
+            .put("source_id", sourceId)
+            .put("kind", "activity_detail_windows")
+            .put("external_batch_id", payload.optString("external_batch_id"))
+            .put("generated_at", payload.optString("generated_at"))
+            .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
+            .put("server_day", syncWindow.serverDay)
+            .put("activity_date", syncWindow.serverDay)
+            .put("timezone", "UTC")
+            .put("server_timezone", "UTC")
+            .put("window_from_utc", syncWindow.windowFromUtc.toString())
+            .put("window_to_utc", syncWindow.windowToUtc.toString())
+            .put("records", records)
+            .put("is_live_ui_only", false)
+            .put("source_of_truth", "health_connect")
+        attachPayloadSecurityIfNeeded(apiBase, token, body)
+        postJsonForResponse("$apiBase/api/v1/me/sources/sync", token, body)
+    }
+
+    private fun fetchDetailRequests(apiBase: String, token: String, serverDay: String): JSONArray {
+        val response = getJsonForResponse("$apiBase/api/v1/me/activity/detail-requests?activity_date=$serverDay", token)
+        return response.optJSONObject("data")?.optJSONArray("requests") ?: JSONArray()
+    }
 
     private fun fetchSyncWindow(apiBase: String, token: String): ServerSyncWindow {
         val response = getJsonForResponse("$apiBase/api/v1/me/activity/sync-window", token)
@@ -176,7 +218,21 @@ class HealthSyncWorker(
         if (nonce.isBlank() || signingKey.isBlank()) return
 
         body.put("nonce", nonce)
-        body.put("payload_signature", hmacSha256Hex(nonce, signingKey))
+        body.put("payload_signature", hmacSha256Hex(canonicalActivityPayload(body, data), signingKey))
+    }
+
+    private fun canonicalActivityPayload(body: JSONObject, nonceData: JSONObject): String {
+        val canonical = JSONObject()
+            .put("user_id", nonceData.optLong("user_id", 0L))
+            .put("source_id", body.optLong("source_id", 0L))
+            .put("kind", if (body.has("kind")) body.optString("kind") else JSONObject.NULL)
+            .put("activity_date", if (body.has("server_day")) body.optString("server_day") else if (body.has("activity_date")) body.optString("activity_date") else JSONObject.NULL)
+            .put("timezone", if (body.has("timezone")) body.optString("timezone") else JSONObject.NULL)
+            .put("generated_at", if (body.has("generated_at")) body.optString("generated_at") else JSONObject.NULL)
+            .put("nonce", if (body.has("nonce")) body.optString("nonce") else JSONObject.NULL)
+            .put("app_version", if (body.has("app_version")) body.optString("app_version") else JSONObject.NULL)
+            .put("records", body.optJSONArray("records") ?: JSONArray())
+        return canonical.toString()
     }
 
     private fun postJsonForResponse(url: String, token: String, body: JSONObject): JSONObject {

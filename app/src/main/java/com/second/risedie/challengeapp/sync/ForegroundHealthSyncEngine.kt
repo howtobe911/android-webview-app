@@ -193,6 +193,13 @@ class ForegroundHealthSyncEngine(
             posted += 1
         }
 
+        val detailResult = postPendingDetailRequests(apiBase, token, sourceId, repository, syncWindow)
+        accepted += detailResult.optInt("accepted", 0)
+        rejected += detailResult.optInt("rejected", 0)
+        posted += detailResult.optInt("posted", 0)
+        detailResult.optJSONObject("current_state")?.let { currentState = it }
+        detailResult.optJSONObject("authoritative_totals")?.let { totals = it }
+
         val type = if (accepted > 0 || duplicate > 0 || currentState != null || posted > 0) "success" else "no_data"
         val fresh = type == "success"
         if (fresh) setLastSuccessfulSyncAt(Instant.now())
@@ -238,6 +245,53 @@ class ForegroundHealthSyncEngine(
         // Health Connect remains the only authoritative server sync value.
         // Native counter is used only by the live/pending layer and is never merged into this payload.
         payload.put("preferred_source", "health_connect")
+    }
+
+
+    private suspend fun postPendingDetailRequests(
+        apiBase: String,
+        token: String,
+        sourceId: Long,
+        repository: HealthConnectRepository,
+        syncWindow: ServerSyncWindow,
+    ): JSONObject {
+        val result = JSONObject().put("accepted", 0).put("rejected", 0).put("posted", 0)
+        val requests = fetchDetailRequests(apiBase, token, syncWindow.serverDay)
+        if (requests.length() == 0) return result
+
+        val payload = repository.buildDetailWindowsPayload(requests)
+        val records = payload.optJSONArray("records") ?: JSONArray()
+        if (records.length() == 0) return result
+
+        val body = JSONObject()
+            .put("source_id", sourceId)
+            .put("kind", "activity_detail_windows")
+            .put("external_batch_id", payload.optString("external_batch_id"))
+            .put("generated_at", payload.optString("generated_at"))
+            .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
+            .put("server_day", syncWindow.serverDay)
+            .put("activity_date", syncWindow.serverDay)
+            .put("timezone", "UTC")
+            .put("server_timezone", "UTC")
+            .put("window_from_utc", syncWindow.windowFromUtc.toString())
+            .put("window_to_utc", syncWindow.windowToUtc.toString())
+            .put("records", records)
+            .put("is_live_ui_only", false)
+            .put("source_of_truth", "health_connect")
+        attachPayloadSecurityIfNeeded(apiBase, token, body, syncWindow.serverDay)
+        val response = postJsonForResponse("$apiBase/api/v1/me/sources/sync", token, body)
+        val data = response.optJSONObject("data") ?: JSONObject()
+        return result
+            .put("accepted", data.optInt("accepted_records", 0))
+            .put("rejected", data.optInt("rejected_records", 0))
+            .put("posted", 1)
+            .put("authoritative_totals", data.optJSONObject("authoritative_totals") ?: JSONObject())
+            .put("current_state", data.optJSONObject("current_state") ?: JSONObject())
+    }
+
+    private fun fetchDetailRequests(apiBase: String, token: String, serverDay: String): JSONArray {
+        val response = getJsonForResponse("$apiBase/api/v1/me/activity/detail-requests?activity_date=$serverDay", token)
+        return response.optJSONObject("data")?.optJSONArray("requests") ?: JSONArray()
     }
 
     private fun fail(type: String, requestId: String, reason: String, message: String): JSONObject = JSONObject()
@@ -297,7 +351,21 @@ class ForegroundHealthSyncEngine(
         val signingKey = data.optString("payload_signing_key")
         if (nonce.isBlank() || signingKey.isBlank()) return
         body.put("nonce", nonce)
-        body.put("payload_signature", hmacSha256Hex(nonce, signingKey))
+        body.put("payload_signature", hmacSha256Hex(canonicalActivityPayload(body, data), signingKey))
+    }
+
+    private fun canonicalActivityPayload(body: JSONObject, nonceData: JSONObject): String {
+        val canonical = JSONObject()
+            .put("user_id", nonceData.optLong("user_id", 0L))
+            .put("source_id", body.optLong("source_id", 0L))
+            .put("kind", if (body.has("kind")) body.optString("kind") else JSONObject.NULL)
+            .put("activity_date", if (body.has("server_day")) body.optString("server_day") else if (body.has("activity_date")) body.optString("activity_date") else JSONObject.NULL)
+            .put("timezone", if (body.has("timezone")) body.optString("timezone") else JSONObject.NULL)
+            .put("generated_at", if (body.has("generated_at")) body.optString("generated_at") else JSONObject.NULL)
+            .put("nonce", if (body.has("nonce")) body.optString("nonce") else JSONObject.NULL)
+            .put("app_version", if (body.has("app_version")) body.optString("app_version") else JSONObject.NULL)
+            .put("records", body.optJSONArray("records") ?: JSONArray())
+        return canonical.toString()
     }
 
     private fun hmacSha256Hex(message: String, secret: String): String {

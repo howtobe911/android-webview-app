@@ -250,6 +250,61 @@ class HealthConnectRepository(private val context: Context) {
 
 
 
+
+
+    suspend fun buildDetailWindowsPayload(requests: JSONArray): JSONObject = withContext(Dispatchers.IO) {
+        val client = clientOrNull() ?: return@withContext emptyPayload("Health Connect недоступен.")
+        if (!hasPermissions()) return@withContext emptyPayload("Разрешения Health Connect не выданы.")
+
+        val generatedAt = Instant.now()
+        val records = JSONArray()
+        for (requestIndex in 0 until requests.length()) {
+            val request = requests.optJSONObject(requestIndex) ?: continue
+            val activityType = request.optString("activity_type", "walk")
+            val metric = request.optString("metric", "steps")
+            val from = runCatching { Instant.parse(request.optString("requested_window_from")) }.getOrNull() ?: continue
+            val to = runCatching { Instant.parse(request.optString("requested_window_to")) }.getOrNull() ?: continue
+            if (!to.isAfter(from)) continue
+
+            val bucketMinutes = max(1L, request.optLong("preferred_bucket_minutes", 1L))
+            var cursor = from
+            while (cursor.isBefore(to)) {
+                val bucketEnd = cursor.plus(Duration.ofMinutes(bucketMinutes)).let { if (it.isAfter(to)) to else it }
+                val value = when (metric) {
+                    "steps", "walk_steps" -> readStepsTotal(client, cursor, bucketEnd, JSONArray()).total.toDouble()
+                    "meters", "run_distance", "run_meters" -> calculateRunningDistanceMeters(client, cursor, bucketEnd)
+                    "run_duration", "run_workout_seconds", "workout" -> calculateRunningDurationSeconds(client, cursor, bucketEnd).toDouble()
+                    else -> 0.0
+                }
+
+                if (value > 0.0) {
+                    records.put(
+                        JSONObject()
+                            .put("activity_type", activityType)
+                            .put("metric_type", metric)
+                            .put("value", String.format(Locale.US, "%.2f", value).toDouble())
+                            .put("recorded_from", cursor.toString())
+                            .put("recorded_to", bucketEnd.toString())
+                            .put("bucket_minutes", bucketMinutes)
+                            .put("detail_request_id", request.optLong("id", 0L))
+                            .put("source_hash", "health-connect-detail-${request.optLong("id", 0L)}-${cursor.epochSecond}-${bucketEnd.epochSecond}-${String.format(Locale.US, "%.2f", value)}")
+                    )
+                }
+                cursor = bucketEnd
+            }
+        }
+
+        JSONObject()
+            .put("kind", "activity_detail_windows")
+            .put("external_batch_id", uniqueBatchId("android-detail-windows", generatedAt))
+            .put("generated_at", generatedAt.toString())
+            .put("device_time", generatedAt.toString())
+            .put("server_timezone", "UTC")
+            .put("window_size_minutes", 1)
+            .put("records", records)
+    }
+
+
     suspend fun buildDayCloseSnapshotPayload(
         activityDate: LocalDate,
         includeRunDistance: Boolean = true,
