@@ -15,6 +15,7 @@ import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
