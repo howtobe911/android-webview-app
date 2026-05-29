@@ -274,7 +274,7 @@ class ChallengeAppBridge(
     }
 
     fun dispose() {
-        liveStepTracker.stop()
+        liveStepTracker.dispose()
         foregroundSyncEngine.onAppBackground()
         bridgeScope.cancel()
     }

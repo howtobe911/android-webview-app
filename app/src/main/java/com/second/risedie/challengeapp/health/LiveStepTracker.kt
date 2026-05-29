@@ -23,7 +23,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     private val counterSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
     private val detectorSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
     private val overlayStore = LiveActivityOverlayStore(appContext)
-    private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val started = AtomicBoolean(false)
     private val stateLock = Any()
 
@@ -50,6 +50,10 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         if (!started.compareAndSet(true, false)) return
         runBlocking { persistCurrent(force = true) }
         sensorManager?.unregisterListener(this)
+    }
+
+    fun dispose() {
+        stop()
         persistScope.cancel()
     }
 
