@@ -267,30 +267,20 @@ class HealthConnectRepository(private val context: Context) {
             if (!to.isAfter(from)) continue
 
             val bucketMinutes = max(1L, request.optLong("preferred_bucket_minutes", 1L))
-            var cursor = from
-            while (cursor.isBefore(to)) {
-                val bucketEnd = cursor.plus(Duration.ofMinutes(bucketMinutes)).let { if (it.isAfter(to)) to else it }
-                val value = when (metric) {
-                    "steps", "walk_steps" -> readStepsTotal(client, cursor, bucketEnd, JSONArray()).total.toDouble()
-                    "meters", "run_distance", "run_meters" -> calculateRunningDistanceMeters(client, cursor, bucketEnd)
-                    "run_duration", "run_workout_seconds", "workout" -> calculateRunningDurationSeconds(client, cursor, bucketEnd).toDouble()
-                    else -> 0.0
-                }
-
-                if (value > 0.0) {
-                    records.put(
-                        JSONObject()
-                            .put("activity_type", activityType)
-                            .put("metric_type", metric)
-                            .put("value", String.format(Locale.US, "%.2f", value).toDouble())
-                            .put("recorded_from", cursor.toString())
-                            .put("recorded_to", bucketEnd.toString())
-                            .put("bucket_minutes", bucketMinutes)
-                            .put("detail_request_id", request.optLong("id", 0L))
-                            .put("source_hash", "health-connect-detail-${request.optLong("id", 0L)}-${cursor.epochSecond}-${bucketEnd.epochSecond}-${String.format(Locale.US, "%.2f", value)}")
-                    )
-                }
-                cursor = bucketEnd
+            val buckets = detailBucketValues(client, metric, from, to, bucketMinutes)
+            for (bucket in buckets) {
+                if (bucket.value <= 0.0) continue
+                records.put(
+                    JSONObject()
+                        .put("activity_type", activityType)
+                        .put("metric_type", metric)
+                        .put("value", String.format(Locale.US, "%.2f", bucket.value).toDouble())
+                        .put("recorded_from", bucket.from.toString())
+                        .put("recorded_to", bucket.to.toString())
+                        .put("bucket_minutes", bucketMinutes)
+                        .put("detail_request_id", request.optLong("id", 0L))
+                        .put("source_hash", "health-connect-detail-${request.optLong("id", 0L)}-${bucket.from.epochSecond}-${bucket.to.epochSecond}-${String.format(Locale.US, "%.2f", bucket.value)}")
+                )
             }
         }
 
@@ -304,6 +294,82 @@ class HealthConnectRepository(private val context: Context) {
             .put("records", records)
     }
 
+    private data class DetailBucket(val from: Instant, val to: Instant, var value: Double = 0.0)
+
+    private suspend fun detailBucketValues(
+        client: HealthConnectClient,
+        metric: String,
+        from: Instant,
+        to: Instant,
+        bucketMinutes: Long,
+    ): List<DetailBucket> {
+        val buckets = mutableListOf<DetailBucket>()
+        var cursor = from
+        while (cursor.isBefore(to)) {
+            val bucketEnd = cursor.plus(Duration.ofMinutes(bucketMinutes)).let { if (it.isAfter(to)) to else it }
+            buckets.add(DetailBucket(cursor, bucketEnd))
+            cursor = bucketEnd
+        }
+
+        when (metric) {
+            "steps", "walk_steps" -> fillStepBuckets(client, from, to, buckets)
+            "meters", "run_distance", "run_meters" -> fillDistanceBuckets(client, from, to, buckets)
+            "run_duration", "run_workout_seconds", "workout" -> fillWorkoutDurationBuckets(client, from, to, buckets)
+        }
+
+        return buckets
+    }
+
+    private suspend fun fillStepBuckets(client: HealthConnectClient, from: Instant, to: Instant, buckets: List<DetailBucket>) {
+        val records = client.readRecords(
+            ReadRecordsRequest(
+                recordType = StepsRecord::class,
+                timeRangeFilter = TimeRangeFilter.between(from, to),
+            )
+        ).records
+
+        for (record in records) {
+            distributeValue(record.startTime, record.endTime, record.count.toDouble(), buckets)
+        }
+    }
+
+    private suspend fun fillDistanceBuckets(client: HealthConnectClient, from: Instant, to: Instant, buckets: List<DetailBucket>) {
+        val records = client.readRecords(
+            ReadRecordsRequest(
+                recordType = DistanceRecord::class,
+                timeRangeFilter = TimeRangeFilter.between(from, to),
+            )
+        ).records
+
+        for (record in records) {
+            distributeValue(record.startTime, record.endTime, record.distance.inMeters, buckets)
+        }
+    }
+
+    private suspend fun fillWorkoutDurationBuckets(client: HealthConnectClient, from: Instant, to: Instant, buckets: List<DetailBucket>) {
+        val records = client.readRecords(
+            ReadRecordsRequest(
+                recordType = ExerciseSessionRecord::class,
+                timeRangeFilter = TimeRangeFilter.between(from, to),
+            )
+        ).records
+
+        for (record in records) {
+            distributeValue(record.startTime, record.endTime, Duration.between(record.startTime, record.endTime).seconds.toDouble(), buckets)
+        }
+    }
+
+    private fun distributeValue(start: Instant, end: Instant, value: Double, buckets: List<DetailBucket>) {
+        if (value <= 0.0 || !end.isAfter(start)) return
+        val totalSeconds = max(1L, Duration.between(start, end).seconds).toDouble()
+        for (bucket in buckets) {
+            val overlapStart = if (start.isAfter(bucket.from)) start else bucket.from
+            val overlapEnd = if (end.isBefore(bucket.to)) end else bucket.to
+            if (!overlapEnd.isAfter(overlapStart)) continue
+            val overlapSeconds = Duration.between(overlapStart, overlapEnd).seconds.toDouble()
+            bucket.value += value * (overlapSeconds / totalSeconds)
+        }
+    }
 
     suspend fun buildDayCloseSnapshotPayload(
         activityDate: LocalDate,
