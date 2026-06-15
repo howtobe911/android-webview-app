@@ -30,12 +30,13 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     @Volatile private var updatedAt: Instant? = null
     @Volatile private var cachedState: LiveActivityOverlayState? = null
     @Volatile private var lastPersistAtMillis: Long = 0L
+    @Volatile private var lastSensorFlushAtMillis: Long = 0L
 
     fun start() {
         if (sensorManager == null || counterSensor == null) return
         if (!started.compareAndSet(false, true)) return
 
-        val registered = sensorManager.registerListener(this, counterSensor, SensorManager.SENSOR_DELAY_FASTEST)
+        val registered = sensorManager.registerListener(this, counterSensor, SensorManager.SENSOR_DELAY_FASTEST, 0)
         if (!registered) started.set(false)
     }
 
@@ -63,6 +64,15 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+
+    private fun flushCounterSensorIfNeeded() {
+        val manager = sensorManager ?: return
+        if (!started.get()) return
+        val nowMillis = System.currentTimeMillis()
+        if (nowMillis - lastSensorFlushAtMillis < 1_000L) return
+        lastSensorFlushAtMillis = nowMillis
+        runCatching { manager.flush(this) }
+    }
 
     fun reconcileAnchorFromServer(activityDate: String, serverSteps: Long, serverRecordedAt: String?) {
         applyServerTruth(activityDate, serverSteps, serverRecordedAt)
@@ -149,6 +159,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         if (!activityRecognitionGranted) return unavailable("Для live-шагов нужно разрешение ACTIVITY_RECOGNITION.")
 
         start()
+        flushCounterSensorIfNeeded()
         val state = ensureState(now)
         val raw = rawCounter
         if (raw == null && state.realtimeDeltaSteps <= 0L) {
