@@ -21,7 +21,6 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     private val appContext = context.applicationContext
     private val sensorManager = appContext.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
     private val counterSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
-    private val detectorSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
     private val overlayStore = LiveActivityOverlayStore(appContext)
     private var persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val started = AtomicBoolean(false)
@@ -33,16 +32,10 @@ class LiveStepTracker(context: Context) : SensorEventListener {
     @Volatile private var lastPersistAtMillis: Long = 0L
 
     fun start() {
-        if (sensorManager == null || (counterSensor == null && detectorSensor == null)) return
+        if (sensorManager == null || counterSensor == null) return
         if (!started.compareAndSet(false, true)) return
 
-        var registered = false
-        counterSensor?.let { sensor ->
-            registered = sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_FASTEST) || registered
-        }
-        detectorSensor?.let { sensor ->
-            registered = sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_FASTEST) || registered
-        }
+        val registered = sensorManager.registerListener(this, counterSensor, SensorManager.SENSOR_DELAY_FASTEST)
         if (!registered) started.set(false)
     }
 
@@ -64,11 +57,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             Sensor.TYPE_STEP_COUNTER -> {
                 val value = event.values.firstOrNull() ?: return
                 rawCounter = value
-                updateState(now = now, raw = value, detectorPulse = 0L)
-            }
-            Sensor.TYPE_STEP_DETECTOR -> {
-                val pulses = event.values.firstOrNull()?.takeIf { it > 0f }?.toLong() ?: 1L
-                updateState(now = now, raw = rawCounter, detectorPulse = max(1L, pulses))
+                updateState(now = now, raw = value)
             }
         }
     }
@@ -120,14 +109,9 @@ class LiveStepTracker(context: Context) : SensorEventListener {
                 }
 
                 else -> {
-                    action = "preserve_downward_truth_warning"
-                    val preservedDisplay = max(previous.displaySteps, safeSteps + previous.realtimeDeltaSteps)
-                    val preservedDelta = max(previous.realtimeDeltaSteps, preservedDisplay - safeSteps)
+                    action = "preserve_older_or_lower_truth"
                     previous.copy(
                         activityDate = serverDay,
-                        serverVerifiedSteps = safeSteps,
-                        realtimeDeltaSteps = preservedDelta,
-                        displaySteps = preservedDisplay,
                         lastHealthConnectReadAt = parsedRecordedAt,
                         updatedAt = now,
                     )
@@ -151,15 +135,17 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             displaySteps = serverSteps,
             awaitingFreshBaseline = safeRawBaseline == null,
             lastHealthConnectReadAt = recordedAt,
+            lastResetReason = "server_truth_anchor",
+            lastRawCounterResetAt = now,
             updatedAt = now,
         )
     }
 
     fun snapshot(activityRecognitionGranted: Boolean): JSONObject {
         val now = Instant.now()
-        val dayKey = ensureState(now).activityDate
+        ensureState(now)
 
-        if (counterSensor == null && detectorSensor == null) return unavailable("На устройстве нет аппаратного счётчика шагов.")
+        if (counterSensor == null) return unavailable("На устройстве нет аппаратного счётчика шагов.")
         if (!activityRecognitionGranted) return unavailable("Для live-шагов нужно разрешение ACTIVITY_RECOGNITION.")
 
         start()
@@ -178,7 +164,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
                 .put("message", "Live-счётчик запускается.")
         }
 
-        raw?.let { updateState(now = now, raw = it, detectorPulse = 0L) }
+        raw?.let { updateState(now = now, raw = it) }
         val current = ensureState(now)
         persistCurrentThrottled()
 
@@ -194,66 +180,34 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             .put("activity_date", current.activityDate)
             .put("steps_today", current.displaySteps)
             .put("server_verified_steps", current.serverVerifiedSteps)
+            .put("confirmed_steps", current.serverVerifiedSteps)
             .put("raw_counter_since_boot", raw?.toDouble() ?: JSONObject.NULL)
+            .put("raw_counter_at_anchor", current.sensorBaseValue.toDouble())
+            .put("last_seen_raw_counter", current.sensorLastValue.toDouble())
             .put("sensor_base_value", current.sensorBaseValue.toDouble())
+            .put("last_display_steps", current.displaySteps)
             .put("realtime_delta_steps", current.realtimeDeltaSteps)
+            .put("last_health_connect_sync_at", current.lastHealthConnectReadAt?.toString() ?: JSONObject.NULL)
+            .put("last_reset_reason", current.lastResetReason ?: if (current.awaitingFreshBaseline) "awaiting_fresh_baseline" else JSONObject.NULL)
+            .put("last_raw_counter_reset_at", current.lastRawCounterResetAt?.toString() ?: JSONObject.NULL)
             .put("awaiting_fresh_baseline", current.awaitingFreshBaseline)
             .put("updated_at", current.updatedAt.toString())
     }
 
 
     /**
-     * Returns the best monotonic steps total for the current server UTC day.
-     *
-     * Important: TYPE_STEP_COUNTER is a since-boot counter, not a queryable historical
-     * aggregate. Therefore this method can only add native deltas that were observed
-     * after the app established a server-day anchor. Health Connect still covers
-     * historical/watch data for the same UTC server window.
+     * Returns only confirmed Health Connect steps for the current server UTC day.
+     * TYPE_STEP_COUNTER is local UI overlay only and must never be posted as backend truth.
      */
     fun serverWindowStepsSnapshot(serverWindow: ServerSyncWindow, healthConnectSteps: Long): Long {
-        val now = Instant.now()
-        val serverDay = serverWindow.serverDay.trim()
+        // Backend sync must receive only confirmed Health Connect truth.
+        // TYPE_STEP_COUNTER overlay is local UI only and is exposed through snapshot().
         val safeHealthSteps = max(0L, healthConnectSteps)
-        if (serverDay.isBlank()) return safeHealthSteps
-
-        start()
-        val freshRaw = rawCounter
-        freshRaw?.let { updateState(now = now, raw = it, detectorPulse = 0L) }
-
-        synchronized(stateLock) {
-            val previous = cachedState ?: runBlocking { overlayStore.read() }
-            val dayState = when {
-                previous.activityDate != serverDay || safeHealthSteps > previous.serverVerifiedSteps -> {
-                    hardResetState(serverDay, safeHealthSteps, now, now, freshRaw)
-                }
-
-                safeHealthSteps == previous.serverVerifiedSteps -> {
-                    previous.copy(
-                        activityDate = serverDay,
-                        serverVerifiedSteps = safeHealthSteps,
-                        lastHealthConnectReadAt = now,
-                        updatedAt = now,
-                    )
-                }
-
-                else -> {
-                    val preservedDisplay = max(previous.displaySteps, safeHealthSteps + previous.realtimeDeltaSteps)
-                    val preservedDelta = max(previous.realtimeDeltaSteps, preservedDisplay - safeHealthSteps)
-                    previous.copy(
-                        activityDate = serverDay,
-                        serverVerifiedSteps = safeHealthSteps,
-                        realtimeDeltaSteps = preservedDelta,
-                        displaySteps = preservedDisplay,
-                        lastHealthConnectReadAt = now,
-                        updatedAt = now,
-                    )
-                }
-            }
-
-            cachedState = dayState
-            persistCurrentThrottled(force = true)
-            return max(safeHealthSteps, dayState.displaySteps)
+        val serverDay = serverWindow.serverDay.trim()
+        if (serverDay.isNotBlank()) {
+            applyServerTruth(serverDay, safeHealthSteps, null)
         }
+        return safeHealthSteps
     }
 
     /**
@@ -276,7 +230,7 @@ class LiveStepTracker(context: Context) : SensorEventListener {
         return initialized
     }
 
-    private fun updateState(now: Instant, raw: Float?, detectorPulse: Long) {
+    private fun updateState(now: Instant, raw: Float?) {
         synchronized(stateLock) {
             val previous = ensureState(now)
             val dayKey = previous.activityDate
@@ -300,6 +254,22 @@ class LiveStepTracker(context: Context) : SensorEventListener {
                     realtimeDeltaSteps = 0L,
                     displaySteps = dayState.serverVerifiedSteps,
                     awaitingFreshBaseline = false,
+                    lastResetReason = "sensor_baseline_initialized",
+                    lastRawCounterResetAt = now,
+                    updatedAt = now,
+                )
+                return
+            }
+
+            if (raw != null && dayState.sensorBaseValue > 0f && raw < dayState.sensorBaseValue) {
+                cachedState = dayState.copy(
+                    activityDate = dayKey,
+                    sensorBaseValue = raw,
+                    sensorLastValue = raw,
+                    realtimeDeltaSteps = 0L,
+                    displaySteps = dayState.serverVerifiedSteps,
+                    lastResetReason = "raw_counter_reset",
+                    lastRawCounterResetAt = now,
                     updatedAt = now,
                 )
                 return
@@ -308,13 +278,10 @@ class LiveStepTracker(context: Context) : SensorEventListener {
             val base = when {
                 raw == null -> dayState.sensorBaseValue
                 dayState.sensorBaseValue <= 0f -> raw
-                raw < dayState.sensorLastValue -> raw
                 else -> dayState.sensorBaseValue
             }
-            val counterDelta = raw?.let { max(0f, it - base).toLong() } ?: dayState.realtimeDeltaSteps
-            val detectorDelta = dayState.realtimeDeltaSteps + detectorPulse
-            val realtimeDelta = max(counterDelta, detectorDelta)
-            val display = max(dayState.displaySteps, dayState.serverVerifiedSteps + realtimeDelta)
+            val realtimeDelta = raw?.let { max(0f, it - base).toLong() } ?: dayState.realtimeDeltaSteps
+            val display = dayState.serverVerifiedSteps + realtimeDelta
 
             cachedState = dayState.copy(
                 activityDate = dayKey,

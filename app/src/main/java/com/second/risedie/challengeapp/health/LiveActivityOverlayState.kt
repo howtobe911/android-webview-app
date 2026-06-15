@@ -14,5 +14,7 @@ data class LiveActivityOverlayState(
     val displaySteps: Long = 0,
     val awaitingFreshBaseline: Boolean = false,
     val lastHealthConnectReadAt: Instant? = null,
+    val lastResetReason: String? = null,
+    val lastRawCounterResetAt: Instant? = null,
     val updatedAt: Instant = Instant.now(),
 )

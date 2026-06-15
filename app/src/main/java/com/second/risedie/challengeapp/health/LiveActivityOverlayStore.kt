@@ -27,6 +27,8 @@ class LiveActivityOverlayStore(private val context: Context) {
             displaySteps = data[DISPLAY_STEPS] ?: 0L,
             awaitingFreshBaseline = data[AWAITING_FRESH_BASELINE] ?: false,
             lastHealthConnectReadAt = data[LAST_HEALTH_CONNECT_READ_AT]?.let { Instant.parse(it) },
+            lastResetReason = data[LAST_RESET_REASON],
+            lastRawCounterResetAt = data[LAST_RAW_COUNTER_RESET_AT]?.let { Instant.parse(it) },
             updatedAt = data[UPDATED_AT]?.let { Instant.parse(it) } ?: Instant.now(),
         )
     }
@@ -43,7 +45,9 @@ class LiveActivityOverlayStore(private val context: Context) {
             data[REALTIME_DELTA_STEPS] = state.realtimeDeltaSteps
             data[DISPLAY_STEPS] = state.displaySteps
             data[AWAITING_FRESH_BASELINE] = state.awaitingFreshBaseline
-            state.lastHealthConnectReadAt?.let { data[LAST_HEALTH_CONNECT_READ_AT] = it.toString() }
+            state.lastHealthConnectReadAt?.let { data[LAST_HEALTH_CONNECT_READ_AT] = it.toString() } ?: data.remove(LAST_HEALTH_CONNECT_READ_AT)
+            state.lastResetReason?.let { data[LAST_RESET_REASON] = it } ?: data.remove(LAST_RESET_REASON)
+            state.lastRawCounterResetAt?.let { data[LAST_RAW_COUNTER_RESET_AT] = it.toString() } ?: data.remove(LAST_RAW_COUNTER_RESET_AT)
             data[UPDATED_AT] = state.updatedAt.toString()
         }
     }
@@ -60,6 +64,8 @@ class LiveActivityOverlayStore(private val context: Context) {
         private val DISPLAY_STEPS = longPreferencesKey("display_steps")
         private val AWAITING_FRESH_BASELINE = booleanPreferencesKey("awaiting_fresh_baseline")
         private val LAST_HEALTH_CONNECT_READ_AT = stringPreferencesKey("last_health_connect_read_at")
+        private val LAST_RESET_REASON = stringPreferencesKey("last_reset_reason")
+        private val LAST_RAW_COUNTER_RESET_AT = stringPreferencesKey("last_raw_counter_reset_at")
         private val UPDATED_AT = stringPreferencesKey("updated_at")
     }
 }
