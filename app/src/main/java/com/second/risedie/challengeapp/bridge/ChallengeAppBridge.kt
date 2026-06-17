@@ -42,6 +42,7 @@ class ChallengeAppBridge(
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val permissionFlowInProgress = AtomicBoolean(false)
+    private val physicalPermissionContinuation = AtomicBoolean(false)
     private val permissionsMutex = Mutex()
     private val healthRepository = HealthConnectRepository(context)
     private val liveStepTracker = LiveStepTracker(context)
@@ -155,18 +156,46 @@ class ChallengeAppBridge(
         emitDebugEvent("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
 
         if (!isActivityRecognitionGranted()) {
-            val payload = permissionPayload(
-                available = true,
-                granted = false,
-                pending = true,
-                message = "Запрашиваем системное разрешение на физическую активность.",
-            )
-            cachedPermissionPayload = payload
-            onLaunchActivityRecognitionPermission()
-            return payload
+            physicalPermissionContinuation.set(true)
+            return requestPhysicalActivityPermission()
         }
 
         liveStepTracker.start()
+        return requestHealthSourcePermissions()
+    }
+
+    @JavascriptInterface
+    fun requestPhysicalActivityPermission(): String {
+        logDebug("permissions:physical:request", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted()))
+        emitDebugEvent("permissions:physical:request", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted()))
+
+        if (isActivityRecognitionGranted()) {
+            liveStepTracker.start()
+            val payload = permissionPayload(
+                available = true,
+                granted = healthConnectGrantedFromCache(),
+                pending = false,
+                message = "Разрешение на физическую активность уже выдано.",
+            )
+            cachedPermissionPayload = payload
+            return payload
+        }
+
+        val payload = permissionPayload(
+            available = true,
+            granted = false,
+            pending = true,
+            message = "Запрашиваем системное разрешение на физическую активность.",
+        )
+        cachedPermissionPayload = payload
+        onLaunchActivityRecognitionPermission()
+        return payload
+    }
+
+    @JavascriptInterface
+    fun requestHealthSourcePermissions(): String {
+        logDebug("permissions:source:request", mapOf("sdkStatus" to sdkStatus()))
+        emitDebugEvent("permissions:source:request", mapOf("sdkStatus" to sdkStatus()))
 
         val status = sdkStatus()
         if (status != HealthConnectClient.SDK_AVAILABLE) {
@@ -224,7 +253,7 @@ class ChallengeAppBridge(
                     .createIntent(activity, healthRepository.permissions)
                 onLaunchPermissions(intent)
             } catch (error: Throwable) {
-                logError("permissions:request:error", error)
+                logError("permissions:source:request:error", error)
                 permissionFlowInProgress.set(false)
                 val payload = permissionPayload(
                     available = true,
@@ -249,8 +278,21 @@ class ChallengeAppBridge(
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
         if (granted) {
             liveStepTracker.start()
-            requestActivityPermissions()
+            val continueToHealthConnect = physicalPermissionContinuation.getAndSet(false)
+            if (continueToHealthConnect) {
+                requestHealthSourcePermissions()
+                return
+            }
+            val payload = permissionPayload(
+                available = true,
+                granted = healthConnectGrantedFromCache(),
+                pending = false,
+                message = "Системное разрешение на физическую активность получено.",
+            )
+            cachedPermissionPayload = payload
+            onNotifyJavascript(payload)
         } else {
+            physicalPermissionContinuation.set(false)
             val payload = permissionPayload(
                 available = true,
                 granted = false,
@@ -420,6 +462,15 @@ class ChallengeAppBridge(
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .toString()
+    }
+
+
+    private fun healthConnectGrantedFromCache(): Boolean {
+        return try {
+            JSONObject(cachedPermissionPayload).optBoolean("health_connect_granted", false)
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     private fun unavailablePayload(sdkStatus: Int): String = permissionPayload(false, false, false, unavailableMessage(sdkStatus))
