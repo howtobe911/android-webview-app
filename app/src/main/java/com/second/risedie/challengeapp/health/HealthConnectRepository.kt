@@ -166,70 +166,60 @@ class HealthConnectRepository(private val context: Context) {
             buildActivityWindowsBatch(client, day.minusDays(1), now)?.let { batches.put(it) }
         }
         // Server-window aggregate is always requested by the backend-issued UTC window.
-        // Empty-window zero from Health Connect is not authoritative and must not be sent as a normal batch.
+        // Steps and running distance are sent in one authoritative batch so activity_current_state
+        // receives one combined snapshot instead of two competing partial updates. Finally, a sane idea.
         val hasAuthoritativeSteps = stepsTotal > 0L || stepsRead.recordsSeen > 0 || stepsRead.aggregateSeen
+        val hasAuthoritativeRunDistance = distanceMeters > 0.0
+        val aggregateRecords = JSONArray()
         if (hasAuthoritativeSteps) {
-            batches.put(
+            aggregateRecords.put(
                 JSONObject()
-                        .put("kind", "walk_steps")
-                        .put("external_batch_id", uniqueBatchId("android-steps-serverday-${effectiveWindow.serverDay}", now))
-                        .put("generated_at", now.toString())
-                        .put("device_time", now.toString())
-                        .put("server_timezone", effectiveWindow.serverTimezone)
-                        .put("window_from_utc", windowFromUtc.toString())
-                        .put("window_to_utc", windowToUtc.toString())
-                        .put("server_day_ends_at_utc", effectiveWindow.serverDayEndsAtUtc.toString())
-                        .put(
-                            "records",
-                            JSONArray().put(
-                                JSONObject()
-                                    .put("activity_type", "walk")
-                                    .put("metric_type", "steps")
-                                    .put("value", stepsTotal)
-                                    .put("health_connect_records_seen", stepsRead.recordsSeen)
-                                    .put("health_connect_aggregate_seen", stepsRead.aggregateSeen)
-                                    .put("recorded_from", windowFromUtc.toString())
-                                    .put("recorded_to", windowToUtc.toString())
-                                    .put("window_from_utc", windowFromUtc.toString())
-                                    .put("window_to_utc", windowToUtc.toString())
-                                    .put("server_timezone", effectiveWindow.serverTimezone)
-                                    .put("client_generated_at", now.toString())
-                                    .put("device_time", now.toString())
-                                        )
-                        )
+                    .put("activity_type", "walk")
+                    .put("metric_type", "steps")
+                    .put("value", stepsTotal)
+                    .put("health_connect_records_seen", stepsRead.recordsSeen)
+                    .put("health_connect_aggregate_seen", stepsRead.aggregateSeen)
+                    .put("recorded_from", windowFromUtc.toString())
+                    .put("recorded_to", windowToUtc.toString())
+                    .put("window_from_utc", windowFromUtc.toString())
+                    .put("window_to_utc", windowToUtc.toString())
+                    .put("server_timezone", effectiveWindow.serverTimezone)
+                    .put("client_generated_at", now.toString())
+                    .put("device_time", now.toString())
             )
         } else {
             warnings.put("steps_empty_window_zero_suppressed")
         }
 
-        if (distanceMeters > 0.0) {
+        if (hasAuthoritativeRunDistance) {
             val normalizedDistance = String.format(Locale.US, "%.2f", distanceMeters).toDouble()
+            aggregateRecords.put(
+                JSONObject()
+                    .put("activity_type", "run")
+                    .put("metric_type", "meters")
+                    .put("value", normalizedDistance)
+                    .put("recorded_from", windowFromUtc.toString())
+                    .put("recorded_to", windowToUtc.toString())
+                    .put("window_from_utc", windowFromUtc.toString())
+                    .put("window_to_utc", windowToUtc.toString())
+                    .put("server_timezone", effectiveWindow.serverTimezone)
+                    .put("client_generated_at", now.toString())
+                    .put("device_time", now.toString())
+            )
+        }
+
+        if (aggregateRecords.length() > 0) {
             batches.put(
                 JSONObject()
-                    .put("kind", "run_distance")
-                    .put("external_batch_id", uniqueBatchId("android-distance-serverday-${effectiveWindow.serverDay}", now))
+                    .put("kind", "health_connect_aggregate")
+                    .put("external_batch_id", uniqueBatchId("android-aggregate-serverday-${effectiveWindow.serverDay}", now))
                     .put("generated_at", now.toString())
                     .put("device_time", now.toString())
                     .put("server_timezone", effectiveWindow.serverTimezone)
                     .put("window_from_utc", windowFromUtc.toString())
                     .put("window_to_utc", windowToUtc.toString())
                     .put("server_day_ends_at_utc", effectiveWindow.serverDayEndsAtUtc.toString())
-                    .put(
-                        "records",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("activity_type", "run")
-                                .put("metric_type", "meters")
-                                .put("value", normalizedDistance)
-                                .put("recorded_from", windowFromUtc.toString())
-                                .put("recorded_to", windowToUtc.toString())
-                                .put("window_from_utc", windowFromUtc.toString())
-                                .put("window_to_utc", windowToUtc.toString())
-                                .put("server_timezone", effectiveWindow.serverTimezone)
-                                .put("client_generated_at", now.toString())
-                                .put("device_time", now.toString())
-                                    )
-                    )
+                    .put("records", aggregateRecords)
             )
         }
 
