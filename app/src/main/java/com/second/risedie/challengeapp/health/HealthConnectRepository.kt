@@ -118,7 +118,7 @@ class HealthConnectRepository(private val context: Context) {
         var maxSteps = 0L
         for (batchIndex in 0 until batches.length()) {
             val batch = batches.optJSONObject(batchIndex) ?: continue
-            if (batch.optString("kind") != "walk_steps") continue
+            if (batch.optString("kind") !in setOf("walk_steps", "health_connect_aggregate")) continue
             val records = batch.optJSONArray("records") ?: continue
             for (recordIndex in 0 until records.length()) {
                 val record = records.optJSONObject(recordIndex) ?: continue
