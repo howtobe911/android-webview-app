@@ -2,6 +2,7 @@ package com.second.risedie.challengeapp.health
 
 import android.content.Context
 import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.HealthConnectFeatures
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.ExerciseSessionRecord
@@ -35,11 +36,28 @@ data class ServerSyncWindow(
 class HealthConnectRepository(private val context: Context) {
     private val appContext = context.applicationContext
 
-    val permissions: Set<String> = setOf(
+    val dataPermissions: Set<String> = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getReadPermission(DistanceRecord::class),
         HealthPermission.getReadPermission(ExerciseSessionRecord::class),
     )
+
+    val permissions: Set<String>
+        get() = dataPermissions
+
+    val backgroundReadPermission: String
+        get() = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND
+
+    fun isBackgroundReadAvailable(): Boolean {
+        val client = clientOrNull() ?: return false
+        return try {
+            client.features.getFeatureStatus(
+                HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND,
+            ) == HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     fun sdkStatus(): Int = try {
         HealthConnectClient.getSdkStatus(appContext, HEALTH_CONNECT_PACKAGE_NAME)
@@ -60,7 +78,7 @@ class HealthConnectRepository(private val context: Context) {
         clientOrNull()?.permissionController?.getGrantedPermissions() ?: emptySet()
     }
 
-    suspend fun hasPermissions(): Boolean = grantedPermissions().containsAll(permissions)
+    suspend fun hasPermissions(): Boolean = grantedPermissions().containsAll(dataPermissions)
 
     /**
      * Compatibility entry point. Steps and running distance are always read and sent together.

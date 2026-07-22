@@ -29,6 +29,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 class ChallengeAppBridge(
     private val activity: ComponentActivity,
@@ -43,6 +44,7 @@ class ChallengeAppBridge(
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val permissionFlowInProgress = AtomicBoolean(false)
     private val physicalPermissionContinuation = AtomicBoolean(false)
+    private val permissionRequestStage = AtomicReference(PermissionRequestStage.NONE)
     private val permissionsMutex = Mutex()
     private val healthRepository = HealthConnectRepository(context)
     private val liveStepTracker = LiveStepTracker(context)
@@ -78,7 +80,8 @@ class ChallengeAppBridge(
             .put("health_connect_package", HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME)
             .put("sdk_status", status)
             .put("available", status == HealthConnectClient.SDK_AVAILABLE)
-            .put("permissions", JSONArray(healthRepository.permissions.toList()))
+            .put("permissions", JSONArray(healthRepository.dataPermissions.toList()))
+            .put("background_read_supported", healthRepository.isBackgroundReadAvailable())
             .put("activity_recognition_granted", isActivityRecognitionGranted())
             .put("app_version", BuildConfig.VERSION_NAME)
             .put("app_version_code", BuildConfig.VERSION_CODE)
@@ -235,7 +238,7 @@ class ChallengeAppBridge(
                 }
 
                 val grantedPermissions = safeGrantedPermissions(client)
-                if (grantedPermissions.containsAll(healthRepository.permissions)) {
+                if (grantedPermissions.containsAll(healthRepository.dataPermissions)) {
                     permissionFlowInProgress.set(false)
                     val grantedPayload = permissionPayload(
                         available = true,
@@ -246,11 +249,13 @@ class ChallengeAppBridge(
                     cachedPermissionPayload = grantedPayload
                     onNotifyJavascript(grantedPayload)
                     foregroundSyncEngine.requestForegroundSync("permission_granted")
+                    requestBackgroundReadPermissionInternal()
                     return@launch
                 }
 
+                permissionRequestStage.set(PermissionRequestStage.DATA)
                 val intent = PermissionController.createRequestPermissionResultContract()
-                    .createIntent(activity, healthRepository.permissions)
+                    .createIntent(activity, healthRepository.dataPermissions)
                 onLaunchPermissions(intent)
             } catch (error: Throwable) {
                 logError("permissions:source:request:error", error)
@@ -270,9 +275,57 @@ class ChallengeAppBridge(
     }
 
     fun onPermissionsFlowFinished() {
-        permissionFlowInProgress.set(false)
-        foregroundSyncEngine.requestForegroundSync("permission_granted")
-        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+        bridgeScope.launch {
+            val completedStage = permissionRequestStage.getAndSet(PermissionRequestStage.NONE)
+            permissionFlowInProgress.set(false)
+            val granted = healthRepository.grantedPermissions()
+            val dataGranted = granted.containsAll(healthRepository.dataPermissions)
+
+            if (completedStage == PermissionRequestStage.DATA && dataGranted) {
+                foregroundSyncEngine.requestForegroundSync("permission_granted")
+                if (requestBackgroundReadPermissionInternal()) return@launch
+            }
+
+            refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+        }
+    }
+
+    @JavascriptInterface
+    fun requestBackgroundReadPermission(): String {
+        val supported = healthRepository.isBackgroundReadAvailable()
+        if (!supported) {
+            return backgroundPermissionPayload(false, false, false, "Фоновое чтение не поддерживается устройством.")
+        }
+        val payload = backgroundPermissionPayload(
+            supported = true,
+            granted = backgroundReadGrantedFromCache(),
+            pending = true,
+            message = "Открываем разрешение на фоновое чтение данных.",
+        )
+        cachedPermissionPayload = payload
+        bridgeScope.launch {
+            if (!requestBackgroundReadPermissionInternal()) {
+                refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+            }
+        }
+        return payload
+    }
+
+    private suspend fun requestBackgroundReadPermissionInternal(): Boolean {
+        if (!healthRepository.isBackgroundReadAvailable()) return false
+        val granted = healthRepository.grantedPermissions()
+        if (!granted.containsAll(healthRepository.dataPermissions)) return false
+        if (granted.contains(healthRepository.backgroundReadPermission)) {
+            refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+            return false
+        }
+        if (!permissionFlowInProgress.compareAndSet(false, true)) return true
+
+        permissionRequestStage.set(PermissionRequestStage.BACKGROUND)
+        val intent = PermissionController.createRequestPermissionResultContract()
+            .createIntent(activity, setOf(healthRepository.backgroundReadPermission))
+        onLaunchPermissions(intent)
+        return true
     }
 
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
@@ -393,13 +446,16 @@ class ChallengeAppBridge(
                     if (client == null) {
                         permissionPayload(false, false, false, "Health Connect не инициализировался.")
                     } else {
-                        val granted = safeGrantedPermissions(client).containsAll(healthRepository.permissions)
+                        val grantedPermissions = safeGrantedPermissions(client)
+                        val granted = grantedPermissions.containsAll(healthRepository.dataPermissions)
                         if (granted && enqueueNativeSync) foregroundSyncEngine.requestForegroundSync("permission_granted")
                         permissionPayload(
                             available = true,
                             granted = granted,
                             pending = permissionFlowInProgress.get(),
                             message = if (granted) "Разрешения получены. Можно синхронизировать шаги и дистанцию." else "Разрешения на шаги и дистанцию пока не выданы.",
+                            backgroundSupported = healthRepository.isBackgroundReadAvailable(),
+                            backgroundGranted = grantedPermissions.contains(healthRepository.backgroundReadPermission),
                         )
                     }
                 }
@@ -449,7 +505,14 @@ class ChallengeAppBridge(
         false
     }
 
-    private fun permissionPayload(available: Boolean, granted: Boolean, pending: Boolean, message: String): String {
+    private fun permissionPayload(
+        available: Boolean,
+        granted: Boolean,
+        pending: Boolean,
+        message: String,
+        backgroundSupported: Boolean = healthRepository.isBackgroundReadAvailable(),
+        backgroundGranted: Boolean = false,
+    ): String {
         return JSONObject()
             .put("available", available)
             .put("granted", granted)
@@ -458,12 +521,33 @@ class ChallengeAppBridge(
             .put("physical_activity_granted", isActivityRecognitionGranted())
             .put("health_connect_granted", granted)
             .put("health_connect_available", sdkStatus() == HealthConnectClient.SDK_AVAILABLE)
+            .put("background_read_supported", backgroundSupported)
+            .put("background_read_granted", backgroundGranted)
             .put("known_health_apps", knownHealthApps())
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .toString()
     }
 
+
+    private fun backgroundPermissionPayload(supported: Boolean, granted: Boolean, pending: Boolean, message: String): String {
+        return JSONObject(cachedPermissionPayload)
+            .put("background_read_supported", supported)
+            .put("background_read_granted", granted)
+            .put("background_read_pending", pending)
+            .put("message", message)
+            .toString()
+    }
+
+    private fun backgroundReadGrantedFromCache(): Boolean {
+        return try {
+            JSONObject(cachedPermissionPayload).optBoolean("background_read_granted", false)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private enum class PermissionRequestStage { NONE, DATA, BACKGROUND }
 
     private fun healthConnectGrantedFromCache(): Boolean {
         return try {
