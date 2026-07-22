@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "403869609158",
+    "project_id": "challengeapp-5db92",
+    "storage_bucket": "challengeapp-5db92.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:403869609158:android:541b00dfcad39b2e203bc7",
+        "android_client_info": {
+          "package_name": "com.second.risedie.challengeapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCM3zyKSnfG9LoMGI_dfvgv9ddATe_7k1k"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

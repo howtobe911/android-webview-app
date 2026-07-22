@@ -25,6 +25,7 @@ import androidx.core.view.WindowCompat
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
 import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
+import com.second.risedie.challengeapp.push.GraFitFirebaseMessagingService
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -32,6 +33,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     companion object {
         private const val LOG_TAG = "GrafitActivitySync"
+        const val EXTRA_PUSH_ROUTE = "grafit_push_route"
+        const val EXTRA_INBOX_ITEM_ID = "grafit_inbox_item_id"
+        @Volatile var isInForeground: Boolean = false
     }
 
     private lateinit var webView: WebView
@@ -42,6 +46,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             bridge.onPermissionsFlowFinished()
         }
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     private val activityRecognitionPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -70,6 +77,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
             onNotifyJavascript = { eventJson -> dispatchJavascriptEvent(eventJson) },
             onDebugJavascript = { eventJson -> dispatchJavascriptDebugEvent(eventJson) },
             onActivitySyncJavascript = { eventJson -> dispatchActivitySyncEvent(eventJson) },
+            onLaunchNotificationPermission = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            },
         )
 
         configureWebView(webView)
@@ -88,8 +98,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
                 .appendQueryParameter("nocache", System.currentTimeMillis().toString())
                 .build()
                 .toString()
-            Log.d(LOG_TAG, "webview:loadUrl url=$launchUrl")
-            webView.loadUrl(launchUrl)
+            val resolvedLaunchUrl = resolvePushLaunchUrl(launchUrl, intent)
+            Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
+            webView.loadUrl(resolvedLaunchUrl)
         } else {
             webView.restoreState(savedInstanceState)
         }
@@ -105,12 +116,40 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        isInForeground = true
+        createNotificationChannel()
         bridge.onHostResumed()
     }
 
     override fun onStop() {
+        isInForeground = false
         bridge.onHostStopped()
         super.onStop()
+    }
+
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val route = sanitizePushRoute(intent.getStringExtra(EXTRA_PUSH_ROUTE) ?: intent.getStringExtra("route")) ?: return
+        webView.loadUrl(Uri.parse(BuildConfig.APP_WEB_URL).buildUpon().encodedPath(route).build().toString())
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(android.app.NotificationManager::class.java)
+            manager.createNotificationChannel(android.app.NotificationChannel(GraFitFirebaseMessagingService.CHANNEL_ID, "GraFit", android.app.NotificationManager.IMPORTANCE_DEFAULT))
+        }
+    }
+
+    private fun resolvePushLaunchUrl(defaultUrl: String, intent: Intent?): String {
+        val route = sanitizePushRoute(intent?.getStringExtra(EXTRA_PUSH_ROUTE) ?: intent?.getStringExtra("route")) ?: return defaultUrl
+        return Uri.parse(defaultUrl).buildUpon().encodedPath(route).build().toString()
+    }
+
+    private fun sanitizePushRoute(route: String?): String? {
+        val value = route?.trim().orEmpty()
+        return value.takeIf { it.startsWith("/web/") && !it.startsWith("//") && !it.contains("://") }
     }
 
     @SuppressLint("SetJavaScriptEnabled")

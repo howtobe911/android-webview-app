@@ -16,6 +16,7 @@ import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
+import com.second.risedie.challengeapp.push.PushTokenRegistrar
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +40,7 @@ class ChallengeAppBridge(
     private val onNotifyJavascript: (String) -> Unit,
     private val onDebugJavascript: (String) -> Unit,
     private val onActivitySyncJavascript: (String) -> Unit,
+    private val onLaunchNotificationPermission: () -> Unit,
 ) {
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -98,6 +100,10 @@ class ChallengeAppBridge(
         val normalizedApiBase = apiBase?.trim().orEmpty()
         val normalizedSourceId = sourceId?.trim()?.toLongOrNull() ?: 0L
 
+        if (normalizedToken.isNotBlank() && normalizedApiBase.startsWith("https://")) {
+            PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase)
+        }
+
         if (normalizedToken.isBlank() || !normalizedApiBase.startsWith("https://") || normalizedSourceId <= 0L) {
             return JSONObject()
                 .put("configured", false)
@@ -106,6 +112,9 @@ class ChallengeAppBridge(
         }
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            onLaunchNotificationPermission()
+        }
         HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
         foregroundSyncEngine.startForegroundLoop()
@@ -123,6 +132,13 @@ class ChallengeAppBridge(
             .toString()
     }
 
+
+
+    @JavascriptInterface
+    fun clearNativePushRegistration(): String {
+        PushTokenRegistrar.clear(context)
+        return JSONObject().put("cleared", true).toString()
+    }
 
     @JavascriptInterface
     fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {

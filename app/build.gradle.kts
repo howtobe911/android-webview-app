@@ -2,6 +2,7 @@ import java.time.Instant
 
 plugins {
     id("com.android.application")
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -66,10 +67,6 @@ android {
             )
         }
 
-        debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
-        }
     }
 
     compileOptions {
@@ -88,6 +85,13 @@ android {
     }
 }
 
+
+androidComponents {
+    beforeVariants(selector().withBuildType("debug")) { variantBuilder ->
+        variantBuilder.enable = false
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
@@ -98,4 +102,6 @@ dependencies {
     implementation("androidx.health.connect:connect-client:1.1.0-rc03")
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation("com.google.firebase:firebase-messaging")
 }
