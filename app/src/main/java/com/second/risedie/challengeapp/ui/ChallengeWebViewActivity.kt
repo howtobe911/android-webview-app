@@ -17,6 +17,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.ValueCallback
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,6 +41,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private val allowedHosts: Set<String> by lazy { parseAllowedHosts(BuildConfig.APP_ALLOWED_HOSTS_JSON) }
 
     private val healthPermissionLauncher =
@@ -49,6 +51,13 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val fileChooserLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            val callback = fileChooserCallback ?: return@registerForActivityResult
+            fileChooserCallback = null
+            callback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data))
+        }
 
     private val activityRecognitionPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -178,6 +187,31 @@ class ChallengeWebViewActivity : ComponentActivity() {
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
 
         target.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?,
+            ): Boolean {
+                fileChooserCallback?.onReceiveValue(null)
+                fileChooserCallback = filePathCallback
+
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "image/*"
+                    putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/jpeg", "image/png", "image/webp"))
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false)
+                }
+
+                return try {
+                    fileChooserLauncher.launch(intent)
+                    true
+                } catch (error: ActivityNotFoundException) {
+                    fileChooserCallback?.onReceiveValue(null)
+                    fileChooserCallback = null
+                    false
+                }
+            }
+
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                 consoleMessage?.let {
                     Log.d(LOG_TAG, "webconsole:${it.messageLevel()} ${it.message()} @${it.sourceId()}:${it.lineNumber()}")
@@ -324,6 +358,8 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
         webView.removeJavascriptInterface("ChallengeAppBridge")
         webView.stopLoading()
         webView.webChromeClient = WebChromeClient()
