@@ -75,6 +75,29 @@ class ChallengeAppBridge(
         get() = healthRepository.clientOrNull()
 
     @JavascriptInterface
+    fun getHealthSyncLog(): String = JSONObject()
+        .put("content", healthSyncLogger.tail(400))
+        .toString()
+
+    @JavascriptInterface
+    fun clearHealthSyncLog(): String {
+        val cleared = healthSyncLogger.clear()
+        return JSONObject()
+            .put("cleared", cleared)
+            .put("content", if (cleared) healthSyncLogger.tail(400) else "Не удалось очистить журнал.")
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun shareHealthSyncLog(): String {
+        val shared = healthSyncLogger.share(activity)
+        return JSONObject()
+            .put("shared", shared)
+            .put("message", if (shared) "Открыто системное меню отправки." else "Журнал ещё не создан.")
+            .toString()
+    }
+
+    @JavascriptInterface
     fun getBridgeInfo(): String {
         val status = sdkStatus()
         return JSONObject()
