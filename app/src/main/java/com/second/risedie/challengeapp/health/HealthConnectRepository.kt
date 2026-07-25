@@ -14,6 +14,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import com.second.risedie.challengeapp.sync.HealthSyncLogger
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -33,7 +34,10 @@ data class ServerSyncWindow(
     val serverDayEndsAtUtc: Instant,
 )
 
-class HealthConnectRepository(private val context: Context) {
+class HealthConnectRepository(
+    private val context: Context,
+    private val syncLogger: HealthSyncLogger? = null,
+) {
     private val appContext = context.applicationContext
 
     val dataPermissions: Set<String> = setOf(
@@ -89,11 +93,13 @@ class HealthConnectRepository(private val context: Context) {
         includeRunDistance: Boolean = true,
         attempts: Int = 4,
         delayMillis: Long = 450L,
+        traceSessionId: String? = null,
     ): JSONObject = buildFreshServerWindowSyncPayload(
         serverWindow = serverWindow,
         includeRunDistance = includeRunDistance,
         attempts = attempts,
         delayMillis = delayMillis,
+        traceSessionId = traceSessionId,
     )
 
     /**
@@ -106,6 +112,7 @@ class HealthConnectRepository(private val context: Context) {
         includeRunDistance: Boolean = true,
         attempts: Int = 4,
         delayMillis: Long = 450L,
+        traceSessionId: String? = null,
     ): JSONObject = withContext(Dispatchers.IO) {
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
@@ -118,8 +125,27 @@ class HealthConnectRepository(private val context: Context) {
         val allWarnings = linkedSetOf<String>()
 
         repeat(attempts.coerceAtLeast(1)) { index ->
+            val attemptStarted = System.nanoTime()
+            traceSessionId?.let { sessionId ->
+                syncLogger?.info(sessionId, TRACE_COMPONENT, "read_attempt_started", JSONObject()
+                    .put("attempt", index + 1)
+                    .put("attempts_total", attempts.coerceAtLeast(1)))
+            }
             val candidate = readSyncSnapshot(client, serverWindow)
             allWarnings.addAll(candidate.diagnostics.warnings)
+            traceSessionId?.let { sessionId ->
+                syncLogger?.info(sessionId, TRACE_COMPONENT, "read_attempt_completed", JSONObject()
+                    .put("attempt", index + 1)
+                    .put("steps", candidate.steps)
+                    .put("run_meters", candidate.runMeters)
+                    .put("steps_aggregate_seen", candidate.diagnostics.stepsAggregateSeen)
+                    .put("steps_records_seen", candidate.diagnostics.stepRecordsSeen)
+                    .put("steps_read_success", candidate.diagnostics.stepsReadSuccess)
+                    .put("run_read_success", candidate.diagnostics.runReadSuccess)
+                    .put("warnings_count", candidate.diagnostics.warnings.size)
+                    .put("effective_window_to_utc", candidate.effectiveWindowToUtc.toString())
+                    .put("duration_ms", (System.nanoTime() - attemptStarted) / 1_000_000))
+            }
 
             if (
                 candidate.diagnostics.stepsReadSuccess && (
@@ -165,6 +191,15 @@ class HealthConnectRepository(private val context: Context) {
                 if (allWarnings.isNotEmpty()) put("warnings", allWarnings.toList().toJsonArray())
             }
         val generatedAt = maxInstant(stepsSnapshot.generatedAt, runSnapshot.generatedAt)
+        traceSessionId?.let { sessionId ->
+            syncLogger?.info(sessionId, TRACE_COMPONENT, "best_snapshot_selected", JSONObject()
+                .put("steps", stepsSnapshot.steps)
+                .put("run_meters", runSnapshot.runMeters)
+                .put("steps_generated_at", stepsSnapshot.generatedAt.toString())
+                .put("run_generated_at", runSnapshot.generatedAt.toString())
+                .put("warnings_count", allWarnings.size))
+            logStepsFreshnessDiagnostics(client, serverWindow, sessionId)
+        }
 
         val combined = SyncSnapshot(
             steps = stepsSnapshot.steps,
@@ -199,7 +234,19 @@ class HealthConnectRepository(private val context: Context) {
         serverWindow: ServerSyncWindow,
         includeClosedDayWindows: Boolean = true,
         includeRunDistance: Boolean = true,
+        traceSessionId: String? = null,
     ): JSONObject = withContext(Dispatchers.IO) {
+        traceSessionId?.let { sessionId ->
+            syncLogger?.info(
+                sessionId,
+                TRACE_COMPONENT,
+                "server_window_read_started",
+                JSONObject()
+                    .put("server_day", serverWindow.serverDay)
+                    .put("window_from_utc", serverWindow.windowFromUtc.toString())
+                    .put("window_to_utc", serverWindow.windowToUtc.toString()),
+            )
+        }
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
         if (!hasPermissions()) {
@@ -221,7 +268,11 @@ class HealthConnectRepository(private val context: Context) {
         buildSyncPayloadJson(snapshot, closedDayBatch)
     }
 
-    suspend fun buildDetailWindowsPayload(requests: JSONArray): JSONObject = withContext(Dispatchers.IO) {
+    suspend fun buildDetailWindowsPayload(
+        requests: JSONArray,
+        traceSessionId: String? = null,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        traceSessionId?.let { syncLogger?.info(it, TRACE_COMPONENT, "detail_read_started", JSONObject().put("requests_count", requests.length())) }
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
         if (!hasPermissions()) {
@@ -278,6 +329,7 @@ class HealthConnectRepository(private val context: Context) {
             .put("server_timezone", "UTC")
             .put("window_size_minutes", 1)
             .put("records", records)
+            .also { traceSessionId?.let { sessionId -> syncLogger?.info(sessionId, TRACE_COMPONENT, "detail_read_completed", JSONObject().put("records_count", records.length())) } }
     }
 
     /**
@@ -287,7 +339,9 @@ class HealthConnectRepository(private val context: Context) {
     suspend fun buildDayCloseSnapshotPayload(
         activityDate: LocalDate,
         includeRunDistance: Boolean = true,
+        traceSessionId: String? = null,
     ): JSONObject = withContext(Dispatchers.IO) {
+        traceSessionId?.let { syncLogger?.info(it, TRACE_COMPONENT, "day_close_read_started", JSONObject().put("activity_date", activityDate.toString())) }
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
         if (!hasPermissions()) {
@@ -344,6 +398,11 @@ class HealthConnectRepository(private val context: Context) {
             .apply {
                 if (warnings.isNotEmpty()) put("warnings", warnings.toJsonArray())
             }
+            .also { traceSessionId?.let { sessionId -> syncLogger?.info(sessionId, TRACE_COMPONENT, "day_close_read_completed", JSONObject()
+                .put("activity_date", activityDate.toString())
+                .put("walk_steps", walkSteps)
+                .put("run_meters", normalizedRunMeters)
+                .put("warnings_count", warnings.size)) } }
     }
 
     private data class SyncSnapshot(
@@ -561,6 +620,40 @@ class HealthConnectRepository(private val context: Context) {
                     put("warnings", snapshot.diagnostics.warnings.toJsonArray())
                 }
             }
+    }
+
+    private suspend fun logStepsFreshnessDiagnostics(
+        client: HealthConnectClient,
+        serverWindow: ServerSyncWindow,
+        sessionId: String,
+    ) {
+        val started = System.nanoTime()
+        runCatching {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = StepsRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(
+                        serverWindow.windowFromUtc,
+                        minInstant(serverWindow.windowToUtc, Instant.now()),
+                    ),
+                )
+            ).records
+        }.onSuccess { records ->
+            val origins = records.map { it.metadata.dataOrigin.packageName }.filter { it.isNotBlank() }.distinct().sorted()
+            val latestRecordAt = records.maxOfOrNull { it.endTime }
+            val totalRaw = records.sumOf { it.count }
+            syncLogger?.info(sessionId, TRACE_COMPONENT, "steps_freshness_diagnostics", JSONObject()
+                .put("records_count", records.size)
+                .put("records_raw_sum", totalRaw)
+                .put("latest_record_at", latestRecordAt?.toString() ?: JSONObject.NULL)
+                .put("record_age_seconds", latestRecordAt?.let { max(0L, Duration.between(it, Instant.now()).seconds) } ?: JSONObject.NULL)
+                .put("origins", JSONArray(origins))
+                .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
+        }.onFailure { error ->
+            if (error is CancellationException) throw error
+            syncLogger?.warn(sessionId, TRACE_COMPONENT, "steps_freshness_diagnostics_failed",
+                JSONObject().put("duration_ms", (System.nanoTime() - started) / 1_000_000), error)
+        }
     }
 
     private suspend fun readStepsTotal(
@@ -1137,6 +1230,7 @@ class HealthConnectRepository(private val context: Context) {
         "$prefix-${now.toEpochMilli()}-${UUID.randomUUID()}"
 
     companion object {
+        private const val TRACE_COMPONENT = "health_connect_repository"
         const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"
     }
 }

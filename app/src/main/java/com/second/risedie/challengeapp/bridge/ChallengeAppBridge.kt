@@ -16,6 +16,7 @@ import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
 import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
+import com.second.risedie.challengeapp.sync.HealthSyncLogger
 import com.second.risedie.challengeapp.push.PushTokenRegistrar
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -48,7 +49,8 @@ class ChallengeAppBridge(
     private val physicalPermissionContinuation = AtomicBoolean(false)
     private val permissionRequestStage = AtomicReference(PermissionRequestStage.NONE)
     private val permissionsMutex = Mutex()
-    private val healthRepository = HealthConnectRepository(context)
+    private val healthSyncLogger = HealthSyncLogger(context)
+    private val healthRepository = HealthConnectRepository(context, healthSyncLogger)
     private val liveStepTracker = LiveStepTracker(context)
     private val foregroundSyncEngine = ForegroundHealthSyncEngine(context, liveStepTracker) { eventJson -> onActivitySyncJavascript(eventJson) }
 
@@ -96,13 +98,10 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun configureNativeHealthSync(token: String?, apiBase: String?, sourceId: String?): String {
+        healthSyncLogger.info("configuration", "bridge", "configure_requested")
         val normalizedToken = token?.trim().orEmpty()
         val normalizedApiBase = apiBase?.trim().orEmpty()
         val normalizedSourceId = sourceId?.trim()?.toLongOrNull() ?: 0L
-
-        if (normalizedToken.isNotBlank() && normalizedApiBase.startsWith("https://")) {
-            PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase)
-        }
 
         if (normalizedToken.isBlank() || !normalizedApiBase.startsWith("https://") || normalizedSourceId <= 0L) {
             return JSONObject()
@@ -112,13 +111,19 @@ class ChallengeAppBridge(
         }
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            onLaunchNotificationPermission()
-        }
         HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
         foregroundSyncEngine.startForegroundLoop()
         val immediate = foregroundSyncEngine.requestForegroundSync("configured")
+
+        runCatching { PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase) }
+            .onFailure { healthSyncLogger.warn("configuration", "bridge", "push_configuration_failed_non_blocking", error = it) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            runCatching { onLaunchNotificationPermission() }
+                .onFailure { healthSyncLogger.warn("configuration", "bridge", "notification_permission_launch_failed_non_blocking", error = it) }
+        }
         emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId, "requestId" to immediate.optString("request_id")))
 
         return JSONObject()
@@ -213,6 +218,7 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun requestHealthSourcePermissions(): String {
+        healthSyncLogger.info("permissions", "bridge", "data_permission_requested")
         logDebug("permissions:source:request", mapOf("sdkStatus" to sdkStatus()))
         emitDebugEvent("permissions:source:request", mapOf("sdkStatus" to sdkStatus()))
 
@@ -292,13 +298,20 @@ class ChallengeAppBridge(
 
     fun onPermissionsFlowFinished() {
         bridgeScope.launch {
+            healthSyncLogger.info("permissions", "bridge", "permission_flow_finished_callback")
             val completedStage = permissionRequestStage.getAndSet(PermissionRequestStage.NONE)
             permissionFlowInProgress.set(false)
             val granted = healthRepository.grantedPermissions()
             val dataGranted = granted.containsAll(healthRepository.dataPermissions)
+            healthSyncLogger.info("permissions", "bridge", "permission_result", JSONObject()
+                .put("stage", completedStage.name)
+                .put("data_granted", dataGranted)
+                .put("background_granted", granted.contains(healthRepository.backgroundReadPermission)))
 
+            if (dataGranted) {
+                foregroundSyncEngine.requestForegroundSync("permission_result")
+            }
             if (completedStage == PermissionRequestStage.DATA && dataGranted) {
-                foregroundSyncEngine.requestForegroundSync("permission_granted")
                 if (requestBackgroundReadPermissionInternal()) return@launch
             }
 
@@ -308,6 +321,7 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun requestBackgroundReadPermission(): String {
+        healthSyncLogger.info("permissions", "bridge", "background_permission_requested")
         val supported = healthRepository.isBackgroundReadAvailable()
         if (!supported) {
             return backgroundPermissionPayload(false, false, false, "Фоновое чтение не поддерживается устройством.")
@@ -345,6 +359,7 @@ class ChallengeAppBridge(
     }
 
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
+        healthSyncLogger.info("permissions", "bridge", "activity_recognition_result", JSONObject().put("granted", granted))
         if (granted) {
             liveStepTracker.start()
             val continueToHealthConnect = physicalPermissionContinuation.getAndSet(false)
