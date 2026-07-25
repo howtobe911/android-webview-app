@@ -137,7 +137,6 @@ class ChallengeAppBridge(
         HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
         foregroundSyncEngine.startForegroundLoop()
-        val immediate = foregroundSyncEngine.requestForegroundSync("configured")
 
         runCatching { PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase) }
             .onFailure { healthSyncLogger.warn("configuration", "bridge", "push_configuration_failed_non_blocking", error = it) }
@@ -147,7 +146,7 @@ class ChallengeAppBridge(
             runCatching { onLaunchNotificationPermission() }
                 .onFailure { healthSyncLogger.warn("configuration", "bridge", "notification_permission_launch_failed_non_blocking", error = it) }
         }
-        emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId, "requestId" to immediate.optString("request_id")))
+        emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId))
 
         return JSONObject()
             .put("configured", true)
@@ -155,8 +154,7 @@ class ChallengeAppBridge(
             .put("server_timezone", "UTC")
             .put("foreground_loop_min_seconds", 90)
             .put("foreground_loop_max_seconds", 180)
-            .put("immediate_sync_queued", true)
-            .put("request_id", immediate.optString("request_id"))
+            .put("immediate_sync_queued", false)
             .toString()
     }
 
@@ -293,7 +291,6 @@ class ChallengeAppBridge(
                     )
                     cachedPermissionPayload = grantedPayload
                     onNotifyJavascript(grantedPayload)
-                    foregroundSyncEngine.requestForegroundSync("permission_granted")
                     requestBackgroundReadPermissionInternal()
                     return@launch
                 }
@@ -331,9 +328,6 @@ class ChallengeAppBridge(
                 .put("data_granted", dataGranted)
                 .put("background_granted", granted.contains(healthRepository.backgroundReadPermission)))
 
-            if (dataGranted) {
-                foregroundSyncEngine.requestForegroundSync("permission_result")
-            }
             if (completedStage == PermissionRequestStage.DATA && dataGranted) {
                 if (requestBackgroundReadPermissionInternal()) return@launch
             }
@@ -502,7 +496,6 @@ class ChallengeAppBridge(
                     } else {
                         val grantedPermissions = safeGrantedPermissions(client)
                         val granted = grantedPermissions.containsAll(healthRepository.dataPermissions)
-                        if (granted && enqueueNativeSync) foregroundSyncEngine.requestForegroundSync("permission_granted")
                         permissionPayload(
                             available = true,
                             granted = granted,

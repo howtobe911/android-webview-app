@@ -28,10 +28,14 @@ class HealthSyncCoordinator(context: Context) {
 
     suspend fun sync(reason: String, sessionId: String): JSONObject = withContext(Dispatchers.IO) {
         val started = System.nanoTime()
+        apiClient.resetSourceSyncHttpCode()
         logger.info(sessionId, COMPONENT, "sync_started", JSONObject().put("reason", reason))
 
         val config = configStore.load()
             ?: return@withContext failure("not_configured", reason, sessionId, "Native sync is not configured")
+        logger.info(sessionId, COMPONENT, "configuration_loaded", JSONObject()
+            .put("api_host", runCatching { java.net.URL(config.apiBase).host }.getOrDefault("invalid"))
+            .put("source_id", config.sourceId))
 
         val sdkStatus = repository.sdkStatus()
         logger.info(sessionId, "health_reader", "sdk_status", JSONObject().put("status", sdkStatus))
@@ -66,7 +70,10 @@ class HealthSyncCoordinator(context: Context) {
                 traceSessionId = sessionId,
             )
             payload.put("preferred_source", "health_connect")
-            logPayloadSummary(sessionId, payload, readStarted)
+            val payloadSummary = logPayloadSummary(sessionId, payload, readStarted)
+            logger.info(sessionId, "health_reader", "health_connect_snapshot", JSONObject(payloadSummary.toString())
+                .put("window_from_utc", syncWindow.windowFromUtc.toString())
+                .put("window_to_utc", syncWindow.windowToUtc.toString()))
 
             val batches = payload.optJSONArray("batches") ?: JSONArray()
             if (batches.length() == 0) {
@@ -120,6 +127,10 @@ class HealthSyncCoordinator(context: Context) {
 
             val type = if (accepted > 0 || duplicate > 0 || currentState != null || posted > 0) "success" else "no_data"
             val fresh = type == "success"
+            val sourceSyncHttpStatus = apiClient.sourceSyncHttpCode()
+            val requestDelivered = sourceSyncHttpStatus != null && sourceSyncHttpStatus in 200..299
+            val serverAccepted = accepted > 0
+            val serverStateChanged = accepted > 0
             val result = JSONObject()
                 .put("type", type)
                 .put("success", fresh)
@@ -133,6 +144,15 @@ class HealthSyncCoordinator(context: Context) {
                 .put("accepted_records", accepted)
                 .put("duplicate_records", duplicate)
                 .put("rejected_records", rejected)
+                .put("steps", payloadSummary.optLong("steps", 0L))
+                .put("run_meters", payloadSummary.optDouble("run_meters", 0.0))
+                .put("records_count", payloadSummary.optInt("records_count", 0))
+                .put("http_status", sourceSyncHttpStatus ?: JSONObject.NULL)
+                .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
+                .put("request_delivered", requestDelivered)
+                .put("server_accepted", serverAccepted)
+                .put("server_state_changed", serverStateChanged)
+                .put("server_updated", serverStateChanged)
                 .put("authoritative_totals", totals ?: JSONObject())
                 .put("current_state", currentState ?: JSONObject())
                 .put("should_reload_snapshot", fresh)
@@ -145,6 +165,15 @@ class HealthSyncCoordinator(context: Context) {
                 .put("accepted_records", accepted)
                 .put("duplicate_records", duplicate)
                 .put("rejected_records", rejected)
+                .put("steps", payloadSummary.optLong("steps", 0L))
+                .put("run_meters", payloadSummary.optDouble("run_meters", 0.0))
+                .put("records_count", payloadSummary.optInt("records_count", 0))
+                .put("http_status", sourceSyncHttpStatus ?: JSONObject.NULL)
+                .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
+                .put("request_delivered", requestDelivered)
+                .put("server_accepted", serverAccepted)
+                .put("server_state_changed", serverStateChanged)
+                .put("server_updated", serverStateChanged)
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
             result
         } catch (error: CancellationException) {
@@ -246,7 +275,7 @@ class HealthSyncCoordinator(context: Context) {
             if (batch.has("window_size_minutes")) put("window_size_minutes", batch.optInt("window_size_minutes", 15))
         }
 
-    private fun logPayloadSummary(sessionId: String, payload: JSONObject, readStarted: Long) {
+    private fun logPayloadSummary(sessionId: String, payload: JSONObject, readStarted: Long): JSONObject {
         val batches = payload.optJSONArray("batches") ?: JSONArray()
         var recordsCount = 0
         var steps: Long? = null
@@ -289,6 +318,7 @@ class HealthSyncCoordinator(context: Context) {
         healthConnectRecordsSeen?.let { fields.put("health_connect_records_seen", it) }
         healthConnectAggregateSeen?.let { fields.put("health_connect_aggregate_seen", it) }
         logger.info(sessionId, "health_reader", "read_completed", fields)
+        return fields
     }
 
     private fun noData(reason: String, sessionId: String, window: ServerSyncWindow, message: String): JSONObject {

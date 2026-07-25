@@ -15,6 +15,12 @@ import javax.crypto.spec.SecretKeySpec
 class HealthSyncApiClient(
     private val logger: HealthSyncLogger,
 ) {
+    @Volatile private var lastHttpCode: Int? = null
+    @Volatile private var sourceSyncHttpCode: Int? = null
+
+    fun lastHttpCode(): Int? = lastHttpCode
+    fun sourceSyncHttpCode(): Int? = sourceSyncHttpCode
+    fun resetSourceSyncHttpCode() { sourceSyncHttpCode = null }
     fun fetchSyncWindow(config: HealthSyncConfig, sessionId: String): ServerSyncWindow {
         logger.info(sessionId, COMPONENT, "sync_window_request")
         val response = getJson("${config.apiBase}/api/v1/me/activity/sync-window", config.token, sessionId, "sync_window")
@@ -113,6 +119,7 @@ class HealthSyncApiClient(
             .put("records_count", body.optJSONArray("records")?.length() ?: 0)
             .put("payload_bytes", body.toString().toByteArray(Charsets.UTF_8).size)
         logger.info(sessionId, COMPONENT, "http_request", fields)
+        logger.info(sessionId, COMPONENT, "http_upload_started", fields)
         return execute(connection, body, sessionId, operation)
     }
 
@@ -138,14 +145,18 @@ class HealthSyncApiClient(
                 OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
             }
             val code = connection.responseCode
+            lastHttpCode = code
+            if (operation == "source_sync") sourceSyncHttpCode = code
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val text = stream?.let { input ->
                 BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader -> reader.readText() }
             }.orEmpty()
-            logger.info(sessionId, COMPONENT, "http_response", JSONObject()
+            val responseFields = JSONObject()
                 .put("operation", operation)
                 .put("http_code", code)
-                .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
+                .put("duration_ms", (System.nanoTime() - started) / 1_000_000)
+            logger.info(sessionId, COMPONENT, "http_response", responseFields)
+            if (body != null) logger.info(sessionId, COMPONENT, "http_upload_completed", responseFields)
             if (code !in 200..299) throw IllegalStateException("$operation failed with HTTP $code")
             return if (text.isBlank()) JSONObject() else JSONObject(text)
         } catch (error: Throwable) {
