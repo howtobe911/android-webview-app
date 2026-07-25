@@ -15,6 +15,7 @@ import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 /** Owns only foreground scheduling, concurrency and WebView event delivery. */
@@ -39,6 +40,18 @@ class ForegroundHealthSyncEngine(
     fun requestForegroundSync(reason: String): JSONObject {
         val normalizedReason = reason.ifBlank { "manual_refresh" }
         val requestId = UUID.randomUUID().toString()
+        if (normalizedReason == "app_start" && !appStartRequested.compareAndSet(false, true)) {
+            logger.info(requestId, COMPONENT, "sync_skipped_duplicate_app_start")
+            return JSONObject()
+                .put("queued", false)
+                .put("type", "skipped_duplicate_app_start")
+                .put("success", true)
+                .put("fresh", false)
+                .put("request_id", requestId)
+                .put("reason", normalizedReason)
+                .put("message", "App-start sync already requested in this process")
+                .put("synced_at", Instant.now().toString())
+        }
         logger.info(requestId, COMPONENT, "sync_queued", JSONObject().put("reason", normalizedReason))
         scope.launch { syncNowForeground(normalizedReason, requestId) }
         return JSONObject()
@@ -142,6 +155,7 @@ class ForegroundHealthSyncEngine(
     private fun emit(payload: JSONObject) = emitSyncEvent(payload.toString())
 
     companion object {
+        private val appStartRequested = AtomicBoolean(false)
         private const val COMPONENT = "foreground_engine"
         private const val PREFS = "grafit_native_health_sync"
         private const val KEY_LAST_SUCCESS = "last_successful_foreground_sync_at"

@@ -1,14 +1,18 @@
 package com.second.risedie.challengeapp.sync
 
 import android.content.Context
+import android.os.RemoteException
 import androidx.health.connect.client.HealthConnectClient
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.time.Instant
 import java.time.LocalDate
 
@@ -26,7 +30,8 @@ class HealthSyncCoordinator(context: Context) {
             .put("source_id", sourceId))
     }
 
-    suspend fun sync(reason: String, sessionId: String): JSONObject = withContext(Dispatchers.IO) {
+    suspend fun sync(reason: String, sessionId: String): JSONObject = processSyncMutex.withLock {
+        withContext(Dispatchers.IO) {
         val started = System.nanoTime()
         apiClient.resetSourceSyncHttpCode()
         logger.info(sessionId, COMPONENT, "sync_started", JSONObject().put("reason", reason))
@@ -183,11 +188,30 @@ class HealthSyncCoordinator(context: Context) {
             logger.warn(sessionId, COMPONENT, "sync_cancelled", JSONObject().put("reason", reason), error)
             throw error
         } catch (error: Throwable) {
-            logger.error(sessionId, COMPONENT, "sync_failed", error, JSONObject()
+            val transient = isTransientFailure(error)
+            logger.error(sessionId, COMPONENT, if (transient) "sync_transient_failure" else "sync_failed", error, JSONObject()
                 .put("reason", reason)
+                .put("retryable", transient)
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
-            failure("failed", reason, sessionId, error.message ?: error.javaClass.simpleName)
+            failure(
+                if (transient) "transient_failure" else "failed",
+                reason,
+                sessionId,
+                error.message ?: error.javaClass.simpleName,
+            ).put("retryable", transient)
         }
+        }
+    }
+
+    private fun isTransientFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is RemoteException || current is IOException) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
     }
 
     private suspend fun postPreviousDayCloseSnapshotIfNeeded(
@@ -353,6 +377,7 @@ class HealthSyncCoordinator(context: Context) {
     }
 
     companion object {
+        private val processSyncMutex = Mutex()
         private const val COMPONENT = "coordinator"
         private const val READ_ATTEMPTS = 8
         private const val READ_DELAY_MS = 750L

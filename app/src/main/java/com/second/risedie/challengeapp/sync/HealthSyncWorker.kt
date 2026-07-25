@@ -2,8 +2,11 @@ package com.second.risedie.challengeapp.sync
 
 import android.app.ActivityManager
 import android.content.Context
+import android.os.RemoteException
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
+import androidx.work.Data
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
@@ -14,6 +17,7 @@ import androidx.work.WorkerParameters
 import com.second.risedie.challengeapp.ui.ChallengeWebViewActivity
 import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
+import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -31,6 +35,7 @@ class HealthSyncWorker(
         val coordinator = HealthSyncCoordinator(applicationContext)
         val appForeground = ChallengeWebViewActivity.isInForeground
         val processImportance = currentProcessImportance()
+        val scheduleKind = inputData.getString(INPUT_SCHEDULE_KIND).orEmpty()
 
         logger.info(sessionId, COMPONENT, "background_worker_started", JSONObject()
             .put("run_attempt_count", runAttemptCount)
@@ -39,6 +44,7 @@ class HealthSyncWorker(
             .put("activity_foreground", appForeground)
             .put("process_importance", processImportance)
             .put("execution_context", if (appForeground) "foreground_process" else "no_foreground_activity")
+            .put("schedule_kind", scheduleKind.ifBlank { "periodic_or_immediate" })
             .put("started_at", Instant.now().toString()))
 
         return try {
@@ -46,7 +52,9 @@ class HealthSyncWorker(
             val resultType = syncResult.optString("type", "unknown")
             val workResult = when (resultType) {
                 "success", "no_data", "no_permissions", "not_configured", "unavailable" -> "success"
-                else -> "retry"
+                "transient_failure" -> "retry"
+                "failed" -> "failure"
+                else -> "failure"
             }
             val fields = JSONObject()
                 .put("sync_result", resultType)
@@ -66,12 +74,25 @@ class HealthSyncWorker(
                 .put("rejected_records", syncResult.optInt("rejected_records", 0))
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000)
 
-            if (workResult == "success") {
-                logger.info(sessionId, COMPONENT, "background_worker_completed", fields)
-                Result.success()
-            } else {
-                logger.warn(sessionId, COMPONENT, "background_worker_retry", fields.put("run_attempt_count", runAttemptCount))
-                Result.retry()
+            when (workResult) {
+                "success" -> {
+                    if (scheduleKind == SCHEDULE_KIND_NEXT) {
+                        enqueueNext(applicationContext, ExistingWorkPolicy.APPEND_OR_REPLACE)
+                    } else {
+                        enqueueNext(applicationContext, ExistingWorkPolicy.KEEP)
+                    }
+                    logger.info(sessionId, COMPONENT, "background_worker_completed", fields)
+                    Result.success()
+                }
+                "retry" -> {
+                    logger.warn(sessionId, COMPONENT, "background_worker_retry", fields.put("run_attempt_count", runAttemptCount))
+                    Result.retry()
+                }
+                else -> {
+                    logger.warn(sessionId, COMPONENT, "background_worker_permanent_failure", fields
+                        .put("run_attempt_count", runAttemptCount))
+                    Result.failure()
+                }
             }
         } catch (error: CancellationException) {
             logger.warn(sessionId, COMPONENT, "background_worker_cancelled", JSONObject()
@@ -79,11 +100,24 @@ class HealthSyncWorker(
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000), error)
             throw error
         } catch (error: Throwable) {
-            logger.error(sessionId, COMPONENT, "background_worker_failed", error, JSONObject()
+            val retryable = isTransientFailure(error)
+            logger.error(sessionId, COMPONENT, if (retryable) "background_worker_transient_failure" else "background_worker_failed", error, JSONObject()
                 .put("run_attempt_count", runAttemptCount)
+                .put("retryable", retryable)
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
-            Result.retry()
+            if (retryable) Result.retry() else Result.failure()
         }
+    }
+
+    private fun isTransientFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is RemoteException || current is IOException) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
     }
 
     private fun currentProcessImportance(): Int {
@@ -96,6 +130,10 @@ class HealthSyncWorker(
         private const val COMPONENT = "worker"
         private const val PERIODIC_WORK = "grafit_health_connect_periodic_sync"
         private const val IMMEDIATE_WORK = "grafit_health_connect_immediate_sync"
+        private const val NEXT_WORK = "grafit_health_connect_next_sync"
+        private const val NEXT_DELAY_MINUTES = 15L
+        private const val INPUT_SCHEDULE_KIND = "schedule_kind"
+        private const val SCHEDULE_KIND_NEXT = "next"
 
         fun configure(context: Context, token: String, apiBase: String, sourceId: Long) {
             HealthSyncCoordinator(context.applicationContext).configure(token, apiBase, sourceId)
@@ -108,6 +146,7 @@ class HealthSyncWorker(
                 .build()
             val request = OneTimeWorkRequestBuilder<HealthSyncWorker>()
                 .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context.applicationContext)
                 .enqueueUniqueWork(IMMEDIATE_WORK, ExistingWorkPolicy.REPLACE, request)
@@ -124,6 +163,7 @@ class HealthSyncWorker(
             val request = PeriodicWorkRequestBuilder<HealthSyncWorker>(15, TimeUnit.MINUTES)
                 .setInitialDelay(initialDelayMinutes, TimeUnit.MINUTES)
                 .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             val workManager = WorkManager.getInstance(appContext)
             logger.info("scheduler", COMPONENT, "periodic_work_registration_started", JSONObject()
@@ -170,6 +210,26 @@ class HealthSyncWorker(
                             .put("policy", "KEEP"))
                     }
             }, { runnable -> runnable.run() })
+            enqueueNext(appContext, ExistingWorkPolicy.KEEP)
+        }
+
+        private fun enqueueNext(context: Context, policy: ExistingWorkPolicy) {
+            val appContext = context.applicationContext
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val request = OneTimeWorkRequestBuilder<HealthSyncWorker>()
+                .setInputData(Data.Builder().putString(INPUT_SCHEDULE_KIND, SCHEDULE_KIND_NEXT).build())
+                .setInitialDelay(NEXT_DELAY_MINUTES, TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .build()
+            WorkManager.getInstance(appContext)
+                .enqueueUniqueWork(NEXT_WORK, policy, request)
+            HealthSyncLogger(appContext).info("scheduler", COMPONENT, "next_work_enqueued", JSONObject()
+                .put("unique_name", NEXT_WORK)
+                .put("delay_minutes", NEXT_DELAY_MINUTES)
+                .put("policy", policy.name))
         }
     }
 }
