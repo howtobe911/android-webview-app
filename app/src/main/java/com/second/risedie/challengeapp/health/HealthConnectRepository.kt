@@ -122,14 +122,17 @@ class HealthConnectRepository(
 
         var bestStepsSnapshot: SyncSnapshot? = null
         var bestRunSnapshot: SyncSnapshot? = null
+        var previousCompleteSnapshot: SyncSnapshot? = null
+        var stableCompleteReads = 0
         val allWarnings = linkedSetOf<String>()
+        val attemptsTotal = attempts.coerceAtLeast(1)
 
-        repeat(attempts.coerceAtLeast(1)) { index ->
+        for (index in 0 until attemptsTotal) {
             val attemptStarted = System.nanoTime()
             traceSessionId?.let { sessionId ->
                 syncLogger?.info(sessionId, TRACE_COMPONENT, "read_attempt_started", JSONObject()
                     .put("attempt", index + 1)
-                    .put("attempts_total", attempts.coerceAtLeast(1)))
+                    .put("attempts_total", attemptsTotal))
             }
             val candidate = readSyncSnapshot(client, serverWindow)
             allWarnings.addAll(candidate.diagnostics.warnings)
@@ -173,7 +176,32 @@ class HealthConnectRepository(
                 bestRunSnapshot = candidate
             }
 
-            if (index < attempts.coerceAtLeast(1) - 1) {
+            if (candidate.diagnostics.readComplete) {
+                val previous = previousCompleteSnapshot
+                stableCompleteReads = if (
+                    previous != null &&
+                    previous.steps == candidate.steps &&
+                    previous.runMeters == candidate.runMeters
+                ) stableCompleteReads + 1 else 1
+                previousCompleteSnapshot = candidate
+
+                if (stableCompleteReads >= STABLE_COMPLETE_READS_REQUIRED) {
+                    traceSessionId?.let { sessionId ->
+                        syncLogger?.info(sessionId, TRACE_COMPONENT, "read_attempts_stopped_stable", JSONObject()
+                            .put("attempts_used", index + 1)
+                            .put("attempts_total", attemptsTotal)
+                            .put("stable_reads", stableCompleteReads)
+                            .put("steps", candidate.steps)
+                            .put("run_meters", candidate.runMeters))
+                    }
+                    break
+                }
+            } else {
+                stableCompleteReads = 0
+                previousCompleteSnapshot = null
+            }
+
+            if (index < attemptsTotal - 1) {
                 delay(delayMillis.coerceAtLeast(0L))
             }
         }
@@ -1230,6 +1258,7 @@ class HealthConnectRepository(
         "$prefix-${now.toEpochMilli()}-${UUID.randomUUID()}"
 
     companion object {
+        private const val STABLE_COMPLETE_READS_REQUIRED = 2
         private const val TRACE_COMPONENT = "health_connect_repository"
         const val HEALTH_CONNECT_PACKAGE_NAME = "com.google.android.apps.healthdata"
     }

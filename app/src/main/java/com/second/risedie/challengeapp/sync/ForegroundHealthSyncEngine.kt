@@ -145,7 +145,7 @@ class ForegroundHealthSyncEngine(
         private const val COMPONENT = "foreground_engine"
         private const val PREFS = "grafit_native_health_sync"
         private const val KEY_LAST_SUCCESS = "last_successful_foreground_sync_at"
-        private const val SYNC_TIMEOUT_MS = 45_000L
+        private const val SYNC_TIMEOUT_MS = 90_000L
         private const val FOREGROUND_LOOP_INTERVAL_MIN_MS = 90_000L
         private const val FOREGROUND_LOOP_INTERVAL_MAX_MS = 180_000L
     }

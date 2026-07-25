@@ -129,7 +129,8 @@ class HealthSyncCoordinator(context: Context) {
             val fresh = type == "success"
             val sourceSyncHttpStatus = apiClient.sourceSyncHttpCode()
             val requestDelivered = sourceSyncHttpStatus != null && sourceSyncHttpStatus in 200..299
-            val serverAccepted = accepted > 0
+            val serverProcessingQueued = sourceSyncHttpStatus == 202
+            val serverAccepted = accepted > 0 || serverProcessingQueued
             val serverStateChanged = accepted > 0
             val result = JSONObject()
                 .put("type", type)
@@ -151,6 +152,7 @@ class HealthSyncCoordinator(context: Context) {
                 .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
                 .put("request_delivered", requestDelivered)
                 .put("server_accepted", serverAccepted)
+                .put("server_processing_queued", serverProcessingQueued)
                 .put("server_state_changed", serverStateChanged)
                 .put("server_updated", serverStateChanged)
                 .put("authoritative_totals", totals ?: JSONObject())
@@ -172,6 +174,7 @@ class HealthSyncCoordinator(context: Context) {
                 .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
                 .put("request_delivered", requestDelivered)
                 .put("server_accepted", serverAccepted)
+                .put("server_processing_queued", serverProcessingQueued)
                 .put("server_state_changed", serverStateChanged)
                 .put("server_updated", serverStateChanged)
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000))

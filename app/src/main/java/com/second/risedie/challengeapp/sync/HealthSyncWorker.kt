@@ -54,6 +54,7 @@ class HealthSyncWorker(
                 .put("data_delivered", syncResult.optBoolean("request_delivered", false))
                 .put("request_delivered", syncResult.optBoolean("request_delivered", false))
                 .put("server_accepted", syncResult.optBoolean("server_accepted", false))
+                .put("server_processing_queued", syncResult.optBoolean("server_processing_queued", false))
                 .put("server_state_changed", syncResult.optBoolean("server_state_changed", false))
                 .put("server_updated", syncResult.optBoolean("server_state_changed", false))
                 .put("steps", syncResult.optLong("steps", 0L))

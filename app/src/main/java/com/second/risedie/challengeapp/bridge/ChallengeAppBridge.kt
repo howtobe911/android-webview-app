@@ -134,7 +134,6 @@ class ChallengeAppBridge(
         }
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
-        HealthSyncWorker.configure(context, normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
         foregroundSyncEngine.startForegroundLoop()
 
@@ -529,6 +528,7 @@ class ChallengeAppBridge(
 
     private fun knownHealthAppPackages(): List<Pair<String, String>> = listOf(
         "com.google.android.apps.healthdata" to "Health Connect",
+        "com.google.android.apps.fitness" to "Google Fit",
         "com.sec.android.app.shealth" to "Samsung Health",
         "com.huawei.health" to "Huawei Health",
         "com.hihonor.health" to "Honor Health",
