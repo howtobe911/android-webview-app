@@ -18,11 +18,15 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.ValueCallback
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.addCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updateLayoutParams
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
 import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
@@ -71,6 +75,22 @@ class ChallengeWebViewActivity : ComponentActivity() {
         setContentView(R.layout.activity_challenge_webview)
 
         webView = findViewById(R.id.challengeWebView)
+
+        // The app is edge-to-edge (targetSdk 36), so the WebView itself must be
+        // kept inside the real system-bar area. Otherwise fixed web controls are
+        // rendered underneath Android's status/navigation bars on devices where
+        // those bars are taller (notably 3-button navigation).
+        ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.updateLayoutParams<FrameLayout.LayoutParams> {
+                topMargin = systemBars.top
+                bottomMargin = systemBars.bottom
+                leftMargin = systemBars.left
+                rightMargin = systemBars.right
+            }
+            insets
+        }
+        ViewCompat.requestApplyInsets(webView)
 
         bridge = ChallengeAppBridge(
             activity = this,
