@@ -9,6 +9,7 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
+import java.time.OffsetDateTime
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
@@ -35,9 +36,9 @@ class HealthSyncApiClient(
         val window = ServerSyncWindow(
             serverDay = serverDay,
             serverTimezone = data.optString("server_timezone", "UTC"),
-            windowFromUtc = Instant.parse(windowFrom),
-            windowToUtc = Instant.parse(windowTo),
-            serverDayEndsAtUtc = Instant.parse(endsAt),
+            windowFromUtc = parseServerInstant(windowFrom),
+            windowToUtc = parseServerInstant(windowTo),
+            serverDayEndsAtUtc = parseServerInstant(endsAt),
         )
         logger.info(sessionId, COMPONENT, "sync_window_response", JSONObject()
             .put("server_day", window.serverDay)
@@ -46,6 +47,9 @@ class HealthSyncApiClient(
             .put("window_to_utc", window.windowToUtc.toString()))
         return window
     }
+
+    private fun parseServerInstant(value: String): Instant =
+        OffsetDateTime.parse(value).toInstant()
 
     fun fetchDetailRequests(config: HealthSyncConfig, serverDay: String, sessionId: String): JSONArray {
         val response = getJson(
