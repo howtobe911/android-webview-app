@@ -41,6 +41,7 @@ class ChallengeAppBridge(
     private val onNotifyJavascript: (String) -> Unit,
     private val onDebugJavascript: (String) -> Unit,
     private val onActivitySyncJavascript: (String) -> Unit,
+    private val onPrerequisitesJavascript: (String) -> Unit,
     private val onLaunchNotificationPermission: () -> Unit,
 ) {
     private val context: Context = activity.applicationContext
@@ -117,6 +118,53 @@ class ChallengeAppBridge(
             .put("model", Build.MODEL)
             .put("known_health_apps", knownHealthApps())
             .toString()
+    }
+
+
+    @JavascriptInterface
+    fun getActivityPrerequisites(): String = activityPrerequisitesPayload().toString()
+
+    @JavascriptInterface
+    fun performActivityPrerequisiteAction(actionId: String?): String {
+        val id = actionId?.trim().orEmpty()
+        val packageName = when (id) {
+            "health_connect" -> HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME
+            "google_fit" -> "com.google.android.apps.fitness"
+            "samsung_health" -> "com.sec.android.app.shealth"
+            "huawei_health" -> "com.huawei.health"
+            "honor_health" -> "com.hihonor.health"
+            "mi_fitness" -> "com.xiaomi.wearable"
+            "zepp_life" -> "com.xiaomi.hm.health"
+            "zepp" -> "com.huami.watch.hmwatchmanager"
+            else -> return JSONObject().put("opened", false).put("message", "Неизвестное действие readiness gate.").toString()
+        }
+
+        val sdkStatus = sdkStatus()
+        if (id == "health_connect" && sdkStatus == HealthConnectClient.SDK_UNAVAILABLE) {
+            return JSONObject().put("opened", false).put("message", "Health Connect недоступен на этом устройстве.").toString()
+        }
+
+        val candidates = mutableListOf<Intent>()
+        val healthConnectUpdateRequired = id == "health_connect" &&
+            sdkStatus == HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED
+
+        if (healthConnectUpdateRequired || !isPackageInstalled(packageName)) {
+            candidates += Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$packageName")).setPackage("com.android.vending")
+            candidates += Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$packageName"))
+        } else {
+            context.packageManager.getLaunchIntentForPackage(packageName)?.let { candidates += it }
+            candidates += Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(Uri.parse("package:$packageName"))
+        }
+
+        for (intent in candidates) {
+            try {
+                activity.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return JSONObject().put("opened", true).put("action_id", id).toString()
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: Throwable) {
+            }
+        }
+        return JSONObject().put("opened", false).put("action_id", id).put("message", "Не удалось открыть безопасное действие.").toString()
     }
 
     @JavascriptInterface
@@ -406,9 +454,11 @@ class ChallengeAppBridge(
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        foregroundSyncEngine.onAppForeground("app_resume")
-        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to true))
+        val prerequisitesReady = activityPrerequisitesPayload().optBoolean("ready", false)
+        if (prerequisitesReady) foregroundSyncEngine.onAppForeground("app_resume") else foregroundSyncEngine.onAppBackground()
+        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to prerequisitesReady))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+        try { onPrerequisitesJavascript(activityPrerequisitesPayload().toString()) } catch (_: Throwable) {}
     }
 
     fun onHostStopped() {
@@ -536,6 +586,36 @@ class ChallengeAppBridge(
         "com.xiaomi.hm.health" to "Zepp Life",
         "com.huami.watch.hmwatchmanager" to "Zepp",
     )
+
+
+    private fun activityProviderPackages(): List<Pair<String, String>> = knownHealthAppPackages()
+        .filterNot { it.first == HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME }
+
+    private fun activityPrerequisitesPayload(): JSONObject {
+        val status = sdkStatus()
+        val hcAvailable = status == HealthConnectClient.SDK_AVAILABLE
+        val hcUpdateRequired = status == HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED
+        val installedProviders = JSONArray()
+        for ((packageName, label) in activityProviderPackages()) {
+            if (isPackageInstalled(packageName)) {
+                installedProviders.put(JSONObject().put("package", packageName).put("label", label))
+            }
+        }
+        val providerReady = installedProviders.length() > 0
+        val missing = JSONArray()
+        if (!hcAvailable) missing.put("health_connect")
+        if (!providerReady) missing.put("activity_provider")
+        return JSONObject()
+            .put("platform", "android")
+            .put("ready", hcAvailable && providerReady)
+            .put("blocking", !(hcAvailable && providerReady))
+            .put("health_connect", JSONObject()
+                .put("status", when { hcAvailable -> "available"; hcUpdateRequired -> "install_or_update_required"; else -> "unsupported" })
+                .put("available", hcAvailable)
+                .put("action_id", if (hcUpdateRequired) "health_connect" else JSONObject.NULL))
+            .put("providers", JSONObject().put("ready", providerReady).put("installed", installedProviders))
+            .put("missing", missing)
+    }
 
     private fun knownHealthApps(): JSONArray {
         val array = JSONArray()
