@@ -1,5 +1,6 @@
 package com.second.risedie.challengeapp.bridge
 
+import android.app.ActivityManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -42,6 +43,7 @@ class ChallengeAppBridge(
     private val onDebugJavascript: (String) -> Unit,
     private val onActivitySyncJavascript: (String) -> Unit,
     private val onPrerequisitesJavascript: (String) -> Unit,
+    private val onBackgroundReadinessJavascript: (String) -> Unit,
     private val onLaunchNotificationPermission: () -> Unit,
 ) {
     private val context: Context = activity.applicationContext
@@ -123,6 +125,33 @@ class ChallengeAppBridge(
 
     @JavascriptInterface
     fun getActivityPrerequisites(): String = activityPrerequisitesPayload().toString()
+
+    @JavascriptInterface
+    fun getBackgroundActivityReadiness(): String = backgroundActivityReadinessPayload().toString()
+
+    @JavascriptInterface
+    fun openBackgroundActivitySettings(): String {
+        val packageUri = Uri.parse("package:${context.packageName}")
+        val candidates = listOf(
+            "battery" to Intent("android.settings.APP_BATTERY_SETTINGS").setData(packageUri),
+            "application_details" to Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(packageUri),
+        )
+
+        for ((destination, intent) in candidates) {
+            try {
+                if (intent.resolveActivity(context.packageManager) == null) continue
+                activity.startActivity(intent)
+                return JSONObject().put("opened", true).put("destination", destination).toString()
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: Throwable) {
+            }
+        }
+
+        return JSONObject()
+            .put("opened", false)
+            .put("message", "Не удалось открыть системные настройки приложения.")
+            .toString()
+    }
 
     @JavascriptInterface
     fun performActivityPrerequisiteAction(actionId: String?): String {
@@ -459,6 +488,7 @@ class ChallengeAppBridge(
         emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to prerequisitesReady))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
         try { onPrerequisitesJavascript(activityPrerequisitesPayload().toString()) } catch (_: Throwable) {}
+        try { onBackgroundReadinessJavascript(backgroundActivityReadinessPayload().toString()) } catch (_: Throwable) {}
     }
 
     fun onHostStopped() {
@@ -590,6 +620,25 @@ class ChallengeAppBridge(
 
     private fun activityProviderPackages(): List<Pair<String, String>> = knownHealthAppPackages()
         .filterNot { it.first == HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME }
+
+    private fun backgroundActivityReadinessPayload(): JSONObject {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        if (activityManager == null) {
+            return JSONObject()
+                .put("platform", "android")
+                .put("supported", false)
+                .put("restricted", false)
+                .put("status", "unknown")
+                .put("action_available", true)
+        }
+        val restricted = activityManager.isBackgroundRestricted
+        return JSONObject()
+            .put("platform", "android")
+            .put("supported", true)
+            .put("restricted", restricted)
+            .put("status", if (restricted) "restricted" else "ok")
+            .put("action_available", true)
+    }
 
     private fun activityPrerequisitesPayload(): JSONObject {
         val status = sdkStatus()

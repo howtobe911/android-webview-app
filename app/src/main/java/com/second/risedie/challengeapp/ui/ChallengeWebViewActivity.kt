@@ -107,6 +107,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             onDebugJavascript = { eventJson -> dispatchJavascriptDebugEvent(eventJson) },
             onActivitySyncJavascript = { eventJson -> dispatchActivitySyncEvent(eventJson) },
             onPrerequisitesJavascript = { eventJson -> dispatchPrerequisitesEvent(eventJson) },
+            onBackgroundReadinessJavascript = { eventJson -> dispatchBackgroundReadinessEvent(eventJson) },
             onLaunchNotificationPermission = {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             },
@@ -321,6 +322,23 @@ class ChallengeWebViewActivity : ComponentActivity() {
                     try {
                         var payload = JSON.parse($quoted);
                         window.dispatchEvent(new CustomEvent('challengeapp:prerequisites-changed', { detail: payload }));
+                    } catch (_) {}
+                })();
+                """.trimIndent(),
+                null,
+            )
+        }
+    }
+
+    private fun dispatchBackgroundReadinessEvent(eventJson: String) {
+        runOnUiThread {
+            val quoted = JSONObject.quote(eventJson)
+            webView.evaluateJavascript(
+                """
+                (function() {
+                    try {
+                        var payload = JSON.parse($quoted);
+                        window.dispatchEvent(new CustomEvent('challengeapp:background-readiness-changed', { detail: payload }));
                     } catch (_) {}
                 })();
                 """.trimIndent(),
