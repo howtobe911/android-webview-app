@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import android.webkit.JavascriptInterface
@@ -151,6 +152,35 @@ class ChallengeAppBridge(
             .put("opened", false)
             .put("message", "Не удалось открыть системные настройки приложения.")
             .toString()
+    }
+
+    @JavascriptInterface
+    fun getBatteryOptimizationState(): String {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val provider = activityProviderPackages().firstOrNull { isPackageInstalled(it.first) }
+        fun row(packageName: String, label: String): JSONObject = JSONObject()
+            .put("package", packageName).put("label", label).put("installed", isPackageInstalled(packageName))
+            .put("unrestricted", pm?.isIgnoringBatteryOptimizations(packageName) == true)
+        return JSONObject().put("platform", "android")
+            .put("app", row(context.packageName, "GraFit"))
+            .put("health_connect", row(HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME, "Health Connect"))
+            .put("provider", if (provider != null) row(provider.first, provider.second) else JSONObject.NULL)
+            .toString()
+    }
+
+    @JavascriptInterface
+    fun openBatterySettingsFor(target: String?): String {
+        val provider = activityProviderPackages().firstOrNull { isPackageInstalled(it.first) }
+        val packageName = when (target?.trim()) {
+            "app" -> context.packageName
+            "health_connect" -> HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME
+            "provider" -> provider?.first
+            else -> null
+        } ?: return JSONObject().put("opened", false).put("message", "Приложение не найдено.").toString()
+        val uri = Uri.parse("package:$packageName")
+        val candidates = listOf(Intent("android.settings.APP_BATTERY_SETTINGS").setData(uri), Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(uri))
+        for (intent in candidates) try { if (intent.resolveActivity(context.packageManager) != null) { activity.startActivity(intent); return JSONObject().put("opened", true).put("package", packageName).toString() } } catch (_: Throwable) {}
+        return JSONObject().put("opened", false).put("message", "Не удалось открыть настройки батареи.").toString()
     }
 
     @JavascriptInterface
