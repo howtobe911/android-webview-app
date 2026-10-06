@@ -1,0 +1,11 @@
+.gradle/
+build/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.base64
+signing.properties
+*.log

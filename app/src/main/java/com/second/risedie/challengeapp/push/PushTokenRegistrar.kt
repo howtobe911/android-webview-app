@@ -10,6 +10,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import com.google.firebase.messaging.FirebaseMessaging
+import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import java.util.concurrent.TimeUnit
 
 object PushTokenRegistrar {
@@ -20,8 +21,8 @@ object PushTokenRegistrar {
     private const val REGISTER_WORK = "grafit_push_token_registration"
 
     fun configure(context: Context, accessToken: String, apiBase: String) {
-        val normalizedApiBase = apiBase.trimEnd('/')
-        if (accessToken.isBlank() || !normalizedApiBase.startsWith("https://")) return
+        val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase) ?: return
+        if (accessToken.isBlank()) return
 
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(KEY_TOKEN, accessToken)
@@ -54,7 +55,7 @@ object PushTokenRegistrar {
     internal fun credentials(context: Context): Pair<String, String>? {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val accessToken = prefs.getString(KEY_TOKEN, null).orEmpty()
-        val apiBase = prefs.getString(KEY_API_BASE, null).orEmpty()
-        return if (accessToken.isNotBlank() && apiBase.startsWith("https://")) accessToken to apiBase else null
+        val apiBase = TrustedWebOrigin.canonicalOrigin(prefs.getString(KEY_API_BASE, null))
+        return if (accessToken.isNotBlank() && apiBase != null) accessToken to apiBase else null
     }
 }

@@ -20,6 +20,7 @@ import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import com.second.risedie.challengeapp.sync.HealthSyncLogger
 import com.second.risedie.challengeapp.push.PushTokenRegistrar
+import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -230,10 +231,10 @@ class ChallengeAppBridge(
     fun configureNativeHealthSync(token: String?, apiBase: String?, sourceId: String?): String {
         healthSyncLogger.info("configuration", "bridge", "configure_requested")
         val normalizedToken = token?.trim().orEmpty()
-        val normalizedApiBase = apiBase?.trim().orEmpty()
+        val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase)
         val normalizedSourceId = sourceId?.trim()?.toLongOrNull() ?: 0L
 
-        if (normalizedToken.isBlank() || !normalizedApiBase.startsWith("https://") || normalizedSourceId <= 0L) {
+        if (normalizedToken.isBlank() || normalizedApiBase == null || normalizedSourceId <= 0L) {
             return JSONObject()
                 .put("configured", false)
                 .put("message", "Недостаточно данных для фоновой Health Connect синхронизации.")

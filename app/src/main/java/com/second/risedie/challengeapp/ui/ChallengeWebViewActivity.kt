@@ -30,8 +30,8 @@ import androidx.core.view.updateLayoutParams
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
 import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
+import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import com.second.risedie.challengeapp.push.GraFitFirebaseMessagingService
-import org.json.JSONArray
 import org.json.JSONObject
 
 class ChallengeWebViewActivity : ComponentActivity() {
@@ -46,7 +46,6 @@ class ChallengeWebViewActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
-    private val allowedHosts: Set<String> by lazy { parseAllowedHosts(BuildConfig.APP_ALLOWED_HOSTS_JSON) }
 
     private val healthPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -116,21 +115,15 @@ class ChallengeWebViewActivity : ComponentActivity() {
         configureWebView(webView)
         webView.addJavascriptInterface(bridge, "ChallengeAppBridge")
 
-        webView.clearCache(true)
-        webView.clearHistory()
-        webView.clearFormData()
-        webView.clearSslPreferences()
-
         if (savedInstanceState == null) {
             val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
                 .buildUpon()
                 .appendQueryParameter("app_version", BuildConfig.VERSION_NAME)
                 .appendQueryParameter("app_build", BuildConfig.VERSION_CODE.toString())
-                .appendQueryParameter("nocache", System.currentTimeMillis().toString())
                 .build()
                 .toString()
             val resolvedLaunchUrl = resolvePushLaunchUrl(launchUrl, intent)
-            Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
+            if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
             webView.loadUrl(resolvedLaunchUrl)
         } else {
             webView.restoreState(savedInstanceState)
@@ -186,7 +179,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView(target: WebView) {
         CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(target, true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(target, false)
 
         with(target.settings) {
             javaScriptEnabled = true
@@ -194,7 +187,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             @Suppress("DEPRECATION")
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
-            cacheMode = WebSettings.LOAD_NO_CACHE
+            cacheMode = WebSettings.LOAD_DEFAULT
             builtInZoomControls = false
             displayZoomControls = false
             loadsImagesAutomatically = true
@@ -236,7 +229,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
             override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
                 consoleMessage?.let {
-                    Log.d(LOG_TAG, "webconsole:${it.messageLevel()} ${it.message()} @${it.sourceId()}:${it.lineNumber()}")
+                    if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webconsole:${it.messageLevel()} ${it.message()} @${it.sourceId()}:${it.lineNumber()}")
                 }
                 return super.onConsoleMessage(consoleMessage)
             }
@@ -251,7 +244,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                Log.d(LOG_TAG, "webview:onPageFinished url=$url")
+                if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:onPageFinished url=$url")
                 notifyBridgeReady()
             }
 
@@ -276,7 +269,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     private fun dispatchJavascriptEvent(eventJson: String) {
-        Log.d(LOG_TAG, "dispatchJavascriptEvent payload=$eventJson")
+        if (BuildConfig.DEBUG) Log.d(LOG_TAG, "dispatchJavascriptEvent payload=$eventJson")
         val quoted = JSONObject.quote(eventJson)
         val script = """
             (function() {
@@ -297,7 +290,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
 
     private fun dispatchActivitySyncEvent(eventJson: String) {
-        Log.d(LOG_TAG, "dispatchActivitySyncEvent payload=$eventJson")
+        if (BuildConfig.DEBUG) Log.d(LOG_TAG, "dispatchActivitySyncEvent payload=$eventJson")
         val quoted = JSONObject.quote(eventJson)
         val script = """
             (function() {
@@ -348,7 +341,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     private fun dispatchJavascriptDebugEvent(eventJson: String) {
-        Log.d(LOG_TAG, "dispatchJavascriptDebugEvent payload=$eventJson")
+        if (BuildConfig.DEBUG) Log.d(LOG_TAG, "dispatchJavascriptDebugEvent payload=$eventJson")
         val quoted = JSONObject.quote(eventJson)
         val script = """
             (function() {
@@ -373,12 +366,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         }
     }
 
-    private fun isAllowedInternalUrl(uri: Uri): Boolean {
-        val scheme = uri.scheme?.lowercase() ?: return false
-        if (scheme != "https") return false
-        val host = uri.host?.lowercase() ?: return false
-        return host in allowedHosts
-    }
+    private fun isAllowedInternalUrl(uri: Uri): Boolean = TrustedWebOrigin.isTrustedUrl(uri.toString())
 
     private fun isActivityRecognitionGranted(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -397,15 +385,6 @@ class ChallengeWebViewActivity : ComponentActivity() {
             startActivity(intent)
         } catch (_: ActivityNotFoundException) {
         }
-    }
-
-    private fun parseAllowedHosts(rawJson: String): Set<String> {
-        val array = JSONArray(rawJson)
-        val result = LinkedHashSet<String>()
-        for (index in 0 until array.length()) {
-            result += array.getString(index).lowercase()
-        }
-        return result
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

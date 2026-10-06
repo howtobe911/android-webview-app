@@ -7,6 +7,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.time.Instant
+import java.security.MessageDigest
 
 /**
  * Single structured JSONL journal for the complete native Health Connect sync chain.
@@ -113,7 +114,7 @@ class HealthSyncLogger(context: Context) {
                 val line = JSONObject()
                     .put("ts", Instant.now().toString())
                     .put("level", level)
-                    .put("session_id", sessionId)
+                    .put("trace_id", traceId(sessionId))
                     .put("component", component)
                     .put("event", event)
 
@@ -139,6 +140,12 @@ class HealthSyncLogger(context: Context) {
             if (target.exists()) target.delete()
             if (source.exists()) source.renameTo(target)
         }
+    }
+
+    private fun traceId(sessionId: String): String {
+        if (sessionId.isBlank()) return ""
+        val digest = MessageDigest.getInstance("SHA-256").digest(sessionId.toByteArray(Charsets.UTF_8))
+        return digest.take(8).joinToString("") { "%02x".format(it) }
     }
 
     private fun sanitize(value: String): String = value

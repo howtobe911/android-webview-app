@@ -24,6 +24,7 @@ class PushTokenRegistrationWorker(
 
         val connection = runCatching {
             (URL("$apiBase/api/v1/me/device/push-token").openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
                 requestMethod = "PUT"
                 connectTimeout = 15000
                 readTimeout = 15000

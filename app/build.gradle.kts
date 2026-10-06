@@ -9,26 +9,30 @@ android {
     namespace = "com.second.risedie.challengeapp"
     compileSdk = 36
 
-    signingConfigs {
-        create("release") {
-            val ci = System.getenv("CI") == "true"
-            if (ci) {
-                val keystorePath = System.getenv("CM_KEYSTORE_PATH")
-                val keystorePassword = System.getenv("CM_KEYSTORE_PASSWORD")
-                val keyAliasEnv = System.getenv("CM_KEY_ALIAS")
-                val keyPasswordEnv = System.getenv("CM_KEY_PASSWORD")
+    // Signing material must live outside the repository. CI environment variables
+    // take precedence; local/release automation may use external Gradle properties.
+    val releaseKeystorePath = System.getenv("CM_KEYSTORE_PATH")
+        ?: providers.gradleProperty("GRAFIT_KEYSTORE_PATH").orNull
+    val releaseKeystorePassword = System.getenv("CM_KEYSTORE_PASSWORD")
+        ?: providers.gradleProperty("GRAFIT_KEYSTORE_PASSWORD").orNull
+    val releaseKeyAlias = System.getenv("CM_KEY_ALIAS")
+        ?: providers.gradleProperty("GRAFIT_KEY_ALIAS").orNull
+    val releaseKeyPassword = System.getenv("CM_KEY_PASSWORD")
+        ?: providers.gradleProperty("GRAFIT_KEY_PASSWORD").orNull
+    val releaseSigningConfigured = listOf(
+        releaseKeystorePath,
+        releaseKeystorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword,
+    ).all { !it.isNullOrBlank() }
 
-                if (
-                    !keystorePath.isNullOrBlank() &&
-                    !keystorePassword.isNullOrBlank() &&
-                    !keyAliasEnv.isNullOrBlank() &&
-                    !keyPasswordEnv.isNullOrBlank()
-                ) {
-                    storeFile = file(keystorePath)
-                    storePassword = keystorePassword
-                    keyAlias = keyAliasEnv
-                    keyPassword = keyPasswordEnv
-                }
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(requireNotNull(releaseKeystorePath))
+                storePassword = requireNotNull(releaseKeystorePassword)
+                keyAlias = requireNotNull(releaseKeyAlias)
+                keyPassword = requireNotNull(releaseKeyPassword)
             }
         }
     }
@@ -60,7 +64,9 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -104,4 +110,5 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
+    testImplementation("junit:junit:4.13.2")
 }

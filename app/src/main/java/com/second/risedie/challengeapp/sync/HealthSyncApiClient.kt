@@ -7,6 +7,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
+import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import java.net.URL
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -127,8 +128,10 @@ class HealthSyncApiClient(
         return execute(connection, body, sessionId, operation)
     }
 
-    private fun openConnection(url: String, token: String, method: String): HttpURLConnection =
-        (URL(url).openConnection() as HttpURLConnection).apply {
+    private fun openConnection(url: String, token: String, method: String): HttpURLConnection {
+        require(TrustedWebOrigin.isTrustedUrl(url)) { "Refusing request to untrusted API origin" }
+        return (URL(url).openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
             requestMethod = method
             connectTimeout = 10_000
             readTimeout = 20_000
@@ -136,6 +139,7 @@ class HealthSyncApiClient(
             setRequestProperty("Authorization", "Bearer $token")
             if (method == "POST") setRequestProperty("Content-Type", "application/json")
         }
+    }
 
     private fun execute(
         connection: HttpURLConnection,
