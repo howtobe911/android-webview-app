@@ -1,6 +1,7 @@
 package com.second.risedie.challengeapp.sync
 
 import android.content.Context
+import com.second.risedie.challengeapp.security.SecureCredentialStore
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 
 data class HealthSyncConfig(
@@ -10,7 +11,9 @@ data class HealthSyncConfig(
 )
 
 class HealthSyncConfigStore(context: Context) {
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val credentials = SecureCredentialStore(appContext)
 
     fun save(token: String, apiBase: String, sourceId: Long) {
         val trustedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase)
@@ -18,15 +21,16 @@ class HealthSyncConfigStore(context: Context) {
         require(token.isNotBlank()) { "Missing native API token" }
         require(sourceId > 0L) { "Invalid activity source" }
 
+        credentials.writeAccessToken(token)
         prefs.edit()
-            .putString(KEY_TOKEN, token)
+            .remove(KEY_TOKEN)
             .putString(KEY_API_BASE, trustedApiBase)
             .putLong(KEY_SOURCE_ID, sourceId)
             .apply()
     }
 
     fun load(): HealthSyncConfig? {
-        val token = prefs.getString(KEY_TOKEN, null)?.takeIf { it.isNotBlank() } ?: return null
+        val token = credentials.readAccessToken()?.takeIf { it.isNotBlank() } ?: return null
         val apiBase = TrustedWebOrigin.canonicalOrigin(prefs.getString(KEY_API_BASE, null)) ?: return null
         val sourceId = prefs.getLong(KEY_SOURCE_ID, 0L).takeIf { it > 0L } ?: return null
         return HealthSyncConfig(token, apiBase, sourceId)

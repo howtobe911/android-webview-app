@@ -10,6 +10,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import com.google.firebase.messaging.FirebaseMessaging
+import com.second.risedie.challengeapp.security.SecureCredentialStore
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import java.util.concurrent.TimeUnit
 
@@ -24,8 +25,9 @@ object PushTokenRegistrar {
         val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase) ?: return
         if (accessToken.isBlank()) return
 
+        SecureCredentialStore(context).writeAccessToken(accessToken)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putString(KEY_TOKEN, accessToken)
+            .remove(KEY_TOKEN)
             .putString(KEY_API_BASE, normalizedApiBase)
             .apply()
 
@@ -49,12 +51,13 @@ object PushTokenRegistrar {
 
     fun clear(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+        SecureCredentialStore(context).clearAccessToken()
         WorkManager.getInstance(context.applicationContext).cancelUniqueWork(REGISTER_WORK)
     }
 
     internal fun credentials(context: Context): Pair<String, String>? {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val accessToken = prefs.getString(KEY_TOKEN, null).orEmpty()
+        val accessToken = SecureCredentialStore(context).readAccessToken().orEmpty()
         val apiBase = TrustedWebOrigin.canonicalOrigin(prefs.getString(KEY_API_BASE, null))
         return if (accessToken.isNotBlank() && apiBase != null) accessToken to apiBase else null
     }

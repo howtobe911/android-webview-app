@@ -165,7 +165,7 @@ class HealthSyncLogger(context: Context) {
         private const val LOG_EMPTY = "Журнал пуст."
         private const val LOG_READ_ERROR = "Не удалось прочитать журнал."
         private val FORBIDDEN_KEYS = setOf(
-            "token", "auth_token", "authorization", "payload_signing_key", "payload_signature", "nonce", "records", "body",
+            "token", "auth_token", "authorization", "payload_signing_key", "payload_signature", "play_integrity_token", "integrity_token", "nonce", "records", "body",
         )
     }
 }

@@ -1,5 +1,6 @@
 package com.second.risedie.challengeapp.sync
 
+import android.content.Context
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import org.json.JSONArray
 import org.json.JSONObject
@@ -7,6 +8,7 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
+import com.second.risedie.challengeapp.security.PlayIntegrityTokenProvider
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import java.net.URL
 import java.time.Instant
@@ -15,8 +17,10 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 class HealthSyncApiClient(
+    context: Context,
     private val logger: HealthSyncLogger,
 ) {
+    private val playIntegrity = PlayIntegrityTokenProvider(context.applicationContext)
     @Volatile private var lastHttpCode: Int? = null
     @Volatile private var sourceSyncHttpCode: Int? = null
 
@@ -102,7 +106,30 @@ class HealthSyncApiClient(
         if (nonce.isBlank() || signingKey.isBlank()) return
         body.put("nonce", nonce)
         body.put("payload_signature", hmacSha256Hex(canonicalActivityPayload(body, data), signingKey))
-        logger.info(sessionId, COMPONENT, "payload_security_attached", JSONObject().put("kind", body.optString("kind")))
+
+        val integrityToken = runCatching { playIntegrity.tokenForNonce(nonce) }
+            .onFailure {
+                logger.warn(
+                    sessionId,
+                    COMPONENT,
+                    "play_integrity_request_failed_non_blocking",
+                    JSONObject().put("kind", body.optString("kind")),
+                    it,
+                )
+            }
+            .getOrNull()
+        if (!integrityToken.isNullOrBlank()) {
+            body.put("play_integrity_token", integrityToken)
+        }
+
+        logger.info(
+            sessionId,
+            COMPONENT,
+            "payload_security_attached",
+            JSONObject()
+                .put("kind", body.optString("kind"))
+                .put("play_integrity_token_attached", !integrityToken.isNullOrBlank()),
+        )
     }
 
     private fun getJson(url: String, token: String, sessionId: String, operation: String): JSONObject {

@@ -21,7 +21,7 @@ class HealthSyncCoordinator(context: Context) {
     private val configStore = HealthSyncConfigStore(appContext)
     private val logger = HealthSyncLogger(appContext)
     private val repository = HealthConnectRepository(appContext, logger)
-    private val apiClient = HealthSyncApiClient(logger)
+    private val apiClient = HealthSyncApiClient(appContext, logger)
 
     fun configure(token: String, apiBase: String, sourceId: Long) {
         configStore.save(token, apiBase, sourceId)
