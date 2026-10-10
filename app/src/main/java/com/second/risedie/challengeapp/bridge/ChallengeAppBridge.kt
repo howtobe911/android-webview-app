@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
+import android.os.ext.SdkExtensions
 import android.provider.Settings
 import android.util.Log
 import android.webkit.JavascriptInterface
@@ -51,7 +52,16 @@ class ChallengeAppBridge(
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val permissionFlowInProgress = AtomicBoolean(false)
-    private val physicalPermissionContinuation = AtomicBoolean(false)
+    private val notificationPermissionInProgress = AtomicBoolean(false)
+    private val permissionStateChecked = AtomicBoolean(false)
+    private val stepSourceEvidenceRefreshInProgress = AtomicBoolean(false)
+    private val stepSourceEvidenceChecked = AtomicBoolean(false)
+    private val stepDataObserved = AtomicBoolean(false)
+    private val distanceDataObserved = AtomicBoolean(false)
+    private val exerciseDataObserved = AtomicBoolean(false)
+    private val detectedStepWriterPackage = AtomicReference<String?>(null)
+    private val detectedDistanceWriterPackage = AtomicReference<String?>(null)
+    private val detectedExerciseWriterPackage = AtomicReference<String?>(null)
     private val permissionRequestStage = AtomicReference(PermissionRequestStage.NONE)
     private val permissionsMutex = Mutex()
     private val healthSyncLogger = HealthSyncLogger(context)
@@ -75,6 +85,21 @@ class ChallengeAppBridge(
     }
 
     private fun sdkStatus(): Int = healthRepository.sdkStatus()
+
+    private fun sdkExtension34(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        runCatching { SdkExtensions.getExtensionVersion(Build.VERSION_CODES.UPSIDE_DOWN_CAKE) }.getOrDefault(0)
+    } else {
+        0
+    }
+
+    private fun onDeviceStepsSupported(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && sdkExtension34() >= 20
+
+    private fun notificationPermissionRequired(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+
+    private fun notificationPermissionGranted(): Boolean =
+        !notificationPermissionRequired() ||
+            activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private val healthClient: HealthConnectClient?
         get() = healthRepository.clientOrNull()
@@ -109,6 +134,8 @@ class ChallengeAppBridge(
             .put("bridge", "ChallengeAppBridge")
             .put("platform", "android")
             .put("sdk_int", Build.VERSION.SDK_INT)
+            .put("sdk_extension_34", sdkExtension34())
+            .put("on_device_steps_supported", onDeviceStepsSupported())
             .put("health_connect_package", HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME)
             .put("sdk_status", status)
             .put("available", status == HealthConnectClient.SDK_AVAILABLE)
@@ -159,9 +186,16 @@ class ChallengeAppBridge(
     fun getBatteryOptimizationState(): String {
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val provider = activityProviderPackages().firstOrNull { isPackageInstalled(it.first) }
-        fun row(packageName: String, label: String): JSONObject = JSONObject()
-            .put("package", packageName).put("label", label).put("installed", isPackageInstalled(packageName))
-            .put("unrestricted", pm?.isIgnoringBatteryOptimizations(packageName) == true)
+        fun row(packageName: String, label: String): JSONObject {
+            val ignoringOptimizations: Boolean? = pm?.isIgnoringBatteryOptimizations(packageName)
+            return JSONObject()
+                .put("package", packageName)
+                .put("label", label)
+                .put("installed", isPackageInstalled(packageName))
+                .put("optimization_state_known", ignoringOptimizations != null)
+                .put("ignoring_battery_optimizations", ignoringOptimizations ?: JSONObject.NULL)
+                .put("unrestricted", ignoringOptimizations ?: JSONObject.NULL) // compatibility alias; not an Android UI-mode claim
+        }
         return JSONObject().put("platform", "android")
             .put("app", row(context.packageName, "GraFit"))
             .put("health_connect", row(HealthConnectRepository.HEALTH_CONNECT_PACKAGE_NAME, "Health Connect"))
@@ -247,12 +281,7 @@ class ChallengeAppBridge(
 
         runCatching { PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase) }
             .onFailure { healthSyncLogger.warn("configuration", "bridge", "push_configuration_failed_non_blocking", error = it) }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            runCatching { onLaunchNotificationPermission() }
-                .onFailure { healthSyncLogger.warn("configuration", "bridge", "notification_permission_launch_failed_non_blocking", error = it) }
-        }
+        // Permission dialogs are owned by the first-launch/recovery coordinator. Configuration must be side-effect free.
         emitDebugEvent("foreground_sync:configured", mapOf("apiBase" to normalizedApiBase, "sourceId" to normalizedSourceId))
 
         return JSONObject()
@@ -307,11 +336,9 @@ class ChallengeAppBridge(
         logDebug("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
         emitDebugEvent("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
 
-        if (!isActivityRecognitionGranted()) {
-            physicalPermissionContinuation.set(true)
-            return requestPhysicalActivityPermission()
-        }
-
+        // Compatibility wrapper for explicit user actions: request only the next missing layer.
+        // It intentionally does not chain multiple system dialogs; the coordinator owns sequencing.
+        if (!isActivityRecognitionGranted()) return requestPhysicalActivityPermission()
         liveStepTracker.start()
         return requestHealthSourcePermissions()
     }
@@ -395,10 +422,12 @@ class ChallengeAppBridge(
                         granted = true,
                         pending = false,
                         message = "Разрешения Health Connect уже выданы.",
+                        backgroundSupported = healthRepository.isBackgroundReadAvailable(),
+                        backgroundGranted = grantedPermissions.contains(healthRepository.backgroundReadPermission),
                     )
                     cachedPermissionPayload = grantedPayload
                     onNotifyJavascript(grantedPayload)
-                    requestBackgroundReadPermissionInternal()
+                    refreshActivitySourceEvidenceAndNotify(force = true)
                     return@launch
                 }
 
@@ -436,7 +465,7 @@ class ChallengeAppBridge(
                 .put("background_granted", granted.contains(healthRepository.backgroundReadPermission)))
 
             if (completedStage == PermissionRequestStage.DATA && dataGranted) {
-                if (requestBackgroundReadPermissionInternal()) return@launch
+                healthClient?.let { refreshActivitySourceEvidenceAndNotify(force = true) }
             }
 
             refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
@@ -482,42 +511,66 @@ class ChallengeAppBridge(
         return true
     }
 
+    @JavascriptInterface
+    fun requestNotificationPermission(): String {
+        val required = notificationPermissionRequired()
+        val granted = notificationPermissionGranted()
+        if (!required || granted) {
+            return JSONObject(cachedPermissionPayload)
+                .put("notification_required", required)
+                .put("notification_granted", true)
+                .put("notification_pending", false)
+                .put("message", if (required) "Разрешение на уведомления уже выдано." else "Разрешение на уведомления не требуется.")
+                .toString()
+        }
+        if (!notificationPermissionInProgress.compareAndSet(false, true)) {
+            return JSONObject(cachedPermissionPayload)
+                .put("notification_required", true)
+                .put("notification_granted", false)
+                .put("notification_pending", true)
+                .put("message", "Окно разрешения на уведомления уже открыто.")
+                .toString()
+        }
+        healthSyncLogger.info("permissions", "bridge", "notification_permission_requested")
+        onLaunchNotificationPermission()
+        return JSONObject(cachedPermissionPayload)
+            .put("notification_required", true)
+            .put("notification_granted", false)
+            .put("notification_pending", true)
+            .put("message", "Запрашиваем разрешение на уведомления.")
+            .toString()
+    }
+
+    fun onNotificationPermissionResult(granted: Boolean) {
+        notificationPermissionInProgress.set(false)
+        healthSyncLogger.info("permissions", "bridge", "notification_permission_result", JSONObject().put("granted", granted))
+        emitDebugEvent("permissions:notification_result", mapOf("granted" to granted))
+        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+    }
+
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
         healthSyncLogger.info("permissions", "bridge", "activity_recognition_result", JSONObject().put("granted", granted))
-        if (granted) {
-            liveStepTracker.start()
-            val continueToHealthConnect = physicalPermissionContinuation.getAndSet(false)
-            if (continueToHealthConnect) {
-                requestHealthSourcePermissions()
-                return
-            }
-            val payload = permissionPayload(
-                available = true,
-                granted = healthConnectGrantedFromCache(),
-                pending = false,
-                message = "Системное разрешение на физическую активность получено.",
-            )
-            cachedPermissionPayload = payload
-            onNotifyJavascript(payload)
-        } else {
-            physicalPermissionContinuation.set(false)
-            val payload = permissionPayload(
-                available = true,
-                granted = false,
-                pending = false,
-                message = "Системное разрешение на физическую активность не выдано.",
-            )
-            cachedPermissionPayload = payload
-            onNotifyJavascript(payload)
-        }
+        if (granted) liveStepTracker.start()
+        val payload = permissionPayload(
+            available = sdkStatus() == HealthConnectClient.SDK_AVAILABLE,
+            granted = healthConnectGrantedFromCache(),
+            pending = false,
+            message = if (granted) {
+                "Системное разрешение на физическую активность получено."
+            } else {
+                "Системное разрешение на физическую активность не выдано."
+            },
+        )
+        cachedPermissionPayload = payload
+        onNotifyJavascript(payload)
+        emitDebugEvent("permissions:activity_recognition_result", mapOf("granted" to granted))
     }
 
     fun onHostResumed() {
         if (isActivityRecognitionGranted()) liveStepTracker.start()
-        val prerequisitesReady = activityPrerequisitesPayload().optBoolean("ready", false)
-        if (prerequisitesReady) foregroundSyncEngine.onAppForeground("app_resume") else foregroundSyncEngine.onAppBackground()
-        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus(), "foregroundSync" to prerequisitesReady))
-        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = false)
+        foregroundSyncEngine.onAppBackground()
+        emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
+        refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true, forceSourceEvidence = true)
         try { onPrerequisitesJavascript(activityPrerequisitesPayload().toString()) } catch (_: Throwable) {}
         try { onBackgroundReadinessJavascript(backgroundActivityReadinessPayload().toString()) } catch (_: Throwable) {}
     }
@@ -586,18 +639,11 @@ class ChallengeAppBridge(
         }
     }
 
-    private fun refreshPermissionState(notifyJavascript: Boolean, enqueueNativeSync: Boolean) {
+    private fun refreshPermissionState(notifyJavascript: Boolean, enqueueNativeSync: Boolean, forceSourceEvidence: Boolean = false) {
         bridgeScope.launch {
             val payload = try {
                 val status = sdkStatus()
-                if (!isActivityRecognitionGranted()) {
-                    permissionPayload(
-                        available = true,
-                        granted = false,
-                        pending = false,
-                        message = "Системное разрешение на физическую активность ещё не выдано.",
-                    )
-                } else if (status != HealthConnectClient.SDK_AVAILABLE) {
+                if (status != HealthConnectClient.SDK_AVAILABLE) {
                     unavailablePayload(status)
                 } else {
                     val client = healthClient
@@ -605,12 +651,27 @@ class ChallengeAppBridge(
                         permissionPayload(false, false, false, "Health Connect не инициализировался.")
                     } else {
                         val grantedPermissions = safeGrantedPermissions(client)
-                        val granted = grantedPermissions.containsAll(healthRepository.dataPermissions)
+                        val dataGranted = grantedPermissions.containsAll(healthRepository.dataPermissions)
+                        if (grantedPermissions.contains(healthRepository.stepsReadPermission)) {
+                            refreshActivitySourceEvidence(force = forceSourceEvidence)
+                        } else {
+                            stepSourceEvidenceChecked.set(false)
+                            stepDataObserved.set(false)
+                            distanceDataObserved.set(false)
+                            exerciseDataObserved.set(false)
+                            detectedStepWriterPackage.set(null)
+                            detectedDistanceWriterPackage.set(null)
+                            detectedExerciseWriterPackage.set(null)
+                        }
                         permissionPayload(
                             available = true,
-                            granted = granted,
+                            granted = dataGranted,
                             pending = permissionFlowInProgress.get(),
-                            message = if (granted) "Разрешения получены. Можно синхронизировать шаги и дистанцию." else "Разрешения на шаги и дистанцию пока не выданы.",
+                            message = when {
+                                !isActivityRecognitionGranted() -> "Системное разрешение на физическую активность ещё не выдано."
+                                dataGranted -> "Разрешения Health Connect получены."
+                                else -> "Разрешения Health Connect на шаги, дистанцию и тренировки пока не выданы."
+                            },
                             backgroundSupported = healthRepository.isBackgroundReadAvailable(),
                             backgroundGranted = grantedPermissions.contains(healthRepository.backgroundReadPermission),
                         )
@@ -619,9 +680,59 @@ class ChallengeAppBridge(
             } catch (error: Throwable) {
                 permissionPayload(false, false, false, error.message ?: "Не удалось проверить состояние Health Connect.")
             }
-            cachedPermissionPayload = payload
-            if (notifyJavascript) onNotifyJavascript(payload)
+            permissionStateChecked.set(true)
+            val checkedPayload = runCatching { JSONObject(payload).put("state_checked", true).toString() }.getOrDefault(payload)
+            cachedPermissionPayload = checkedPayload
+            val permissionState = runCatching { JSONObject(checkedPayload) }.getOrNull()
+            if (enqueueNativeSync) {
+                val physicalGranted = permissionState?.optBoolean("physical_activity_granted", false) == true
+                val healthGranted = permissionState?.optBoolean("health_connect_granted", false) == true
+                val coreReady = activityPrerequisitesPayload(triggerEvidenceRefresh = false).optBoolean("ready", false) &&
+                    physicalGranted && healthGranted
+                if (coreReady) foregroundSyncEngine.onAppForeground("app_resume") else foregroundSyncEngine.onAppBackground()
+            }
+            if (notifyJavascript) onNotifyJavascript(checkedPayload)
+            if (notifyJavascript) {
+                runCatching { onPrerequisitesJavascript(activityPrerequisitesPayload(triggerEvidenceRefresh = false).toString()) }
+            }
         }
+    }
+
+    private suspend fun refreshActivitySourceEvidence(force: Boolean = false) {
+        if (!force && stepSourceEvidenceChecked.get()) return
+        if (!stepSourceEvidenceRefreshInProgress.compareAndSet(false, true)) return
+        try {
+            val stepOrigins = if (onDeviceStepsSupported()) emptySet() else healthRepository.observedStepDataOrigins()
+            val distanceOrigins = healthRepository.observedDistanceDataOrigins()
+            val exerciseOrigins = healthRepository.observedExerciseDataOrigins()
+
+            stepSourceEvidenceChecked.set(true)
+            stepDataObserved.set(stepOrigins.isNotEmpty())
+            distanceDataObserved.set(distanceOrigins.isNotEmpty())
+            exerciseDataObserved.set(exerciseOrigins.isNotEmpty())
+            detectedStepWriterPackage.set(stepOrigins.firstOrNull())
+            detectedDistanceWriterPackage.set(distanceOrigins.firstOrNull())
+            detectedExerciseWriterPackage.set(exerciseOrigins.firstOrNull())
+            emitDebugEvent(
+                "activity_setup:source_evidence",
+                mapOf(
+                    "on_device_steps_supported" to onDeviceStepsSupported(),
+                    "steps_observed" to stepOrigins.isNotEmpty(),
+                    "distance_observed" to distanceOrigins.isNotEmpty(),
+                    "exercise_observed" to exerciseOrigins.isNotEmpty(),
+                    "known_step_provider" to stepOrigins.firstNotNullOfOrNull { origin ->
+                        activityProviderPackages().firstOrNull { it.first == origin }?.second
+                    },
+                ),
+            )
+        } finally {
+            stepSourceEvidenceRefreshInProgress.set(false)
+        }
+    }
+
+    private suspend fun refreshActivitySourceEvidenceAndNotify(force: Boolean = false) {
+        refreshActivitySourceEvidence(force = force)
+        runCatching { onPrerequisitesJavascript(activityPrerequisitesPayload(triggerEvidenceRefresh = false).toString()) }
     }
 
     private suspend fun safeGrantedPermissions(client: HealthConnectClient): Set<String> {
@@ -671,29 +782,130 @@ class ChallengeAppBridge(
             .put("action_available", true)
     }
 
-    private fun activityPrerequisitesPayload(): JSONObject {
+    private fun providerActionId(packageName: String): String? = when (packageName) {
+        "com.google.android.apps.fitness" -> "google_fit"
+        "com.sec.android.app.shealth" -> "samsung_health"
+        "com.huawei.health" -> "huawei_health"
+        "com.hihonor.health" -> "honor_health"
+        "com.xiaomi.wearable" -> "mi_fitness"
+        "com.xiaomi.hm.health" -> "zepp_life"
+        "com.huami.watch.hmwatchmanager" -> "zepp"
+        else -> null
+    }
+
+    private fun activityPrerequisitesPayload(triggerEvidenceRefresh: Boolean = true): JSONObject {
         val status = sdkStatus()
         val hcAvailable = status == HealthConnectClient.SDK_AVAILABLE
         val hcUpdateRequired = status == HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED
+        val onDeviceSteps = onDeviceStepsSupported()
         val installedProviders = JSONArray()
+        val providerCatalog = JSONArray()
+        var firstInstalledProvider: Pair<String, String>? = null
         for ((packageName, label) in activityProviderPackages()) {
-            if (isPackageInstalled(packageName)) {
-                installedProviders.put(JSONObject().put("package", packageName).put("label", label))
+            val installed = isPackageInstalled(packageName)
+            val actionId = providerActionId(packageName)
+            providerCatalog.put(
+                JSONObject()
+                    .put("package", packageName)
+                    .put("label", label)
+                    .put("installed", installed)
+                    .put("action_id", actionId ?: JSONObject.NULL)
+            )
+            if (installed) {
+                if (firstInstalledProvider == null) firstInstalledProvider = packageName to label
+                installedProviders.put(
+                    JSONObject()
+                        .put("package", packageName)
+                        .put("label", label)
+                        .put("action_id", actionId ?: JSONObject.NULL)
+                )
             }
         }
-        val providerReady = installedProviders.length() > 0
+
+        val externalRequired = !onDeviceSteps
+        val observedWriter = stepDataObserved.get()
+        val knownProviderPrepared = installedProviders.length() > 0
+        val stepSourceReady = hcAvailable && (onDeviceSteps || knownProviderPrepared || observedWriter)
+        val detectedPackage = detectedStepWriterPackage.get()
+        val detectedKnownProvider = detectedPackage?.let { pkg ->
+            activityProviderPackages().firstOrNull { it.first == pkg }
+        }
+        val stepMode = when {
+            onDeviceSteps -> "health_connect_on_device"
+            observedWriter || knownProviderPrepared -> "external_health_connect_writer"
+            else -> "unknown"
+        }
+        val distanceObserved = distanceDataObserved.get()
+        val exerciseObserved = exerciseDataObserved.get()
+        val distanceSourceReady = hcAvailable && (distanceObserved || knownProviderPrepared)
+        val exerciseSourceReady = hcAvailable && (exerciseObserved || knownProviderPrepared)
+
+        if (triggerEvidenceRefresh && hcAvailable && externalRequired && !knownProviderPrepared && !stepSourceEvidenceChecked.get() && healthConnectGrantedFromCache()) {
+            healthClient?.let {
+                bridgeScope.launch {
+                    refreshActivitySourceEvidenceAndNotify()
+                }
+            }
+        }
+
         val missing = JSONArray()
         if (!hcAvailable) missing.put("health_connect")
-        if (!providerReady) missing.put("activity_provider")
+        if (hcAvailable && !stepSourceReady) missing.put("step_source")
+
         return JSONObject()
             .put("platform", "android")
-            .put("ready", hcAvailable && providerReady)
-            .put("blocking", !(hcAvailable && providerReady))
+            .put("ready", hcAvailable && stepSourceReady)
+            .put("blocking", !(hcAvailable && stepSourceReady))
             .put("health_connect", JSONObject()
                 .put("status", when { hcAvailable -> "available"; hcUpdateRequired -> "install_or_update_required"; else -> "unsupported" })
                 .put("available", hcAvailable)
                 .put("action_id", if (hcUpdateRequired) "health_connect" else JSONObject.NULL))
-            .put("providers", JSONObject().put("ready", providerReady).put("installed", installedProviders))
+            .put("capabilities", JSONObject()
+                .put("sdk_int", Build.VERSION.SDK_INT)
+                .put("sdk_extension_34", sdkExtension34())
+                .put("on_device_steps_supported", onDeviceSteps)
+                .put("background_read_supported", healthRepository.isBackgroundReadAvailable()))
+            .put("step_source", JSONObject()
+                .put("ready", stepSourceReady)
+                .put("external_required", externalRequired)
+                .put("mode", stepMode)
+                .put("evidence_checked", stepSourceEvidenceChecked.get() || onDeviceSteps || knownProviderPrepared)
+                .put("data_observed", observedWriter)
+                .put("detected_provider", when {
+                    detectedKnownProvider != null -> JSONObject()
+                        .put("label", detectedKnownProvider.second)
+                        .put("known", true)
+                    observedWriter -> JSONObject().put("label", "Источник Health Connect").put("known", false)
+                    firstInstalledProvider != null -> JSONObject()
+                        .put("label", firstInstalledProvider!!.second)
+                        .put("known", true)
+                    else -> JSONObject.NULL
+                }))
+            .put("distance_source", JSONObject()
+                .put("ready", distanceSourceReady)
+                .put("data_capability", hcAvailable)
+                .put("data_observed", distanceObserved)
+                .put("external_provider_available", knownProviderPrepared)
+                .put("detected_provider", detectedDistanceWriterPackage.get() ?: JSONObject.NULL)
+                .put("blocking_for_step_onboarding", false))
+            .put("exercise_source", JSONObject()
+                .put("ready", exerciseSourceReady)
+                .put("data_capability", hcAvailable)
+                .put("data_observed", exerciseObserved)
+                .put("external_provider_available", knownProviderPrepared)
+                .put("detected_provider", detectedExerciseWriterPackage.get() ?: JSONObject.NULL)
+                .put("blocking_for_step_onboarding", false))
+            .put("permissions", JSONObject()
+                .put("activity_recognition_required", Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                .put("activity_recognition_granted", isActivityRecognitionGranted())
+                .put("notification_required", notificationPermissionRequired())
+                .put("notification_granted", notificationPermissionGranted())
+                .put("background_read_supported", healthRepository.isBackgroundReadAvailable()))
+            // Compatibility fields remain diagnostic only; providers.ready now means step capability, not allowlist membership.
+            .put("providers", JSONObject()
+                .put("ready", stepSourceReady)
+                .put("installed", installedProviders)
+                .put("catalog", providerCatalog))
             .put("missing", missing)
     }
 
@@ -722,6 +934,7 @@ class ChallengeAppBridge(
     ): String {
         return JSONObject()
             .put("available", available)
+            .put("state_checked", permissionStateChecked.get())
             .put("granted", granted)
             .put("pending", pending)
             .put("message", message)
@@ -730,6 +943,14 @@ class ChallengeAppBridge(
             .put("health_connect_available", sdkStatus() == HealthConnectClient.SDK_AVAILABLE)
             .put("background_read_supported", backgroundSupported)
             .put("background_read_granted", backgroundGranted)
+            .put("notification_required", notificationPermissionRequired())
+            .put("notification_granted", notificationPermissionGranted())
+            .put("notification_pending", notificationPermissionInProgress.get())
+            .put("setup_permissions_ready",
+                isActivityRecognitionGranted() &&
+                    granted &&
+                    (!backgroundSupported || backgroundGranted) &&
+                    notificationPermissionGranted())
             .put("known_health_apps", knownHealthApps())
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)

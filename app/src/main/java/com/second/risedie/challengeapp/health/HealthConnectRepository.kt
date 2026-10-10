@@ -40,10 +40,14 @@ class HealthConnectRepository(
 ) {
     private val appContext = context.applicationContext
 
+    val stepsReadPermission: String = HealthPermission.getReadPermission(StepsRecord::class)
+    val distanceReadPermission: String = HealthPermission.getReadPermission(DistanceRecord::class)
+    val exerciseReadPermission: String = HealthPermission.getReadPermission(ExerciseSessionRecord::class)
+
     val dataPermissions: Set<String> = setOf(
-        HealthPermission.getReadPermission(StepsRecord::class),
-        HealthPermission.getReadPermission(DistanceRecord::class),
-        HealthPermission.getReadPermission(ExerciseSessionRecord::class),
+        stepsReadPermission,
+        distanceReadPermission,
+        exerciseReadPermission,
     )
 
     val permissions: Set<String>
@@ -83,6 +87,87 @@ class HealthConnectRepository(
     }
 
     suspend fun hasPermissions(): Boolean = grantedPermissions().containsAll(dataPermissions)
+
+    /**
+     * Diagnostic-only evidence for legacy devices that need an external Health Connect writer.
+     * No DataOrigin allowlist is applied: any real StepsRecord proves that a writer has populated
+     * Health Connect. This is deliberately independent from sync aggregation and never changes
+     * authoritative activity values.
+     */
+    suspend fun observedStepDataOrigins(lookbackDays: Long = 30L): Set<String> = withContext(Dispatchers.IO) {
+        val client = clientOrNull() ?: return@withContext emptySet()
+        val granted = try { client.permissionController.getGrantedPermissions() } catch (_: Throwable) { return@withContext emptySet() }
+        if (!granted.contains(stepsReadPermission)) return@withContext emptySet()
+
+        val to = Instant.now()
+        val from = to.minus(Duration.ofDays(lookbackDays.coerceIn(1L, 30L)))
+        try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = StepsRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(from, to),
+                )
+            ).records
+                .asSequence()
+                .map { it.metadata.dataOrigin.packageName.trim() }
+                .filter { it.isNotBlank() }
+                .toSet()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
+
+    suspend fun observedDistanceDataOrigins(lookbackDays: Long = 30L): Set<String> = withContext(Dispatchers.IO) {
+        val client = clientOrNull() ?: return@withContext emptySet()
+        val granted = try { client.permissionController.getGrantedPermissions() } catch (_: Throwable) { return@withContext emptySet() }
+        if (!granted.contains(distanceReadPermission)) return@withContext emptySet()
+
+        val to = Instant.now()
+        val from = to.minus(Duration.ofDays(lookbackDays.coerceIn(1L, 30L)))
+        try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = DistanceRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(from, to),
+                )
+            ).records
+                .asSequence()
+                .map { it.metadata.dataOrigin.packageName.trim() }
+                .filter { it.isNotBlank() }
+                .toSet()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
+
+    suspend fun observedExerciseDataOrigins(lookbackDays: Long = 30L): Set<String> = withContext(Dispatchers.IO) {
+        val client = clientOrNull() ?: return@withContext emptySet()
+        val granted = try { client.permissionController.getGrantedPermissions() } catch (_: Throwable) { return@withContext emptySet() }
+        if (!granted.contains(exerciseReadPermission)) return@withContext emptySet()
+
+        val to = Instant.now()
+        val from = to.minus(Duration.ofDays(lookbackDays.coerceIn(1L, 30L)))
+        try {
+            client.readRecords(
+                ReadRecordsRequest(
+                    recordType = ExerciseSessionRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(from, to),
+                )
+            ).records
+                .asSequence()
+                .map { it.metadata.dataOrigin.packageName.trim() }
+                .filter { it.isNotBlank() }
+                .toSet()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            emptySet()
+        }
+    }
 
     /**
      * Compatibility entry point. Steps and running distance are always read and sent together.
