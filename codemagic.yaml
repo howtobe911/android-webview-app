@@ -1,6 +1,6 @@
 workflows:
-  android_webview_debug:
-    name: GraFit Android WebView Debug
+  android_webview_verify:
+    name: GraFit Android WebView Verify
     environment:
       java: 21
       vars:
@@ -11,12 +11,12 @@ workflows:
         - ~/.gradle/caches
         - ~/.gradle/wrapper
     scripts:
-      - name: Build debug APK
+      - name: Build reproducible release APK
         script: |
           chmod +x ./gradlew
-          ./gradlew --no-daemon clean app:assembleDebug
+          ./gradlew --no-daemon clean app:assembleRelease
     artifacts:
-      - app/build/outputs/apk/debug/*.apk
+      - app/build/outputs/apk/release/*.apk
 
   android_webview_release:
     name: GraFit Android WebView Release

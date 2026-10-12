@@ -92,7 +92,9 @@ class HealthSyncApiClient(
         serverDay: String,
         sessionId: String,
     ) {
-        if (body.optString("kind") !in FINAL_WINDOW_KINDS) return
+        // Every source-sync payload, including the aggregate snapshot, is bound to a
+        // one-time nonce and the exact canonical request body. Detail windows are not
+        // a privileged security path anymore.
         val nonceResponse = postJsonForResponse(
             "${config.apiBase}/api/v1/me/activity/payload-nonce",
             config.token,
@@ -222,6 +224,5 @@ class HealthSyncApiClient(
 
     companion object {
         private const val COMPONENT = "api_client"
-        private val FINAL_WINDOW_KINDS = setOf("activity_detail_windows")
     }
 }

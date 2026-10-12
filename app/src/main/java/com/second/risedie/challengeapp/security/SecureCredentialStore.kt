@@ -23,17 +23,17 @@ class SecureCredentialStore(context: Context) {
     @Synchronized
     fun writeAccessToken(token: String) {
         require(token.isNotBlank()) { "Access token must not be blank" }
-        persistEncrypted(token)
-        check(decryptStored() == token) { "Secure access-token readback failed" }
+        persistEncrypted(token, KEY_CIPHERTEXT, KEY_IV)
+        check(decryptStored(KEY_CIPHERTEXT, KEY_IV) == token) { "Secure access-token readback failed" }
         clearLegacyTokens()
     }
 
     @Synchronized
     fun readAccessToken(): String? {
-        decryptStored()?.takeIf { it.isNotBlank() }?.let { return it }
+        decryptStored(KEY_CIPHERTEXT, KEY_IV)?.takeIf { it.isNotBlank() }?.let { return it }
         val legacy = readLegacyToken() ?: return null
-        persistEncrypted(legacy)
-        if (decryptStored() != legacy) {
+        persistEncrypted(legacy, KEY_CIPHERTEXT, KEY_IV)
+        if (decryptStored(KEY_CIPHERTEXT, KEY_IV) != legacy) {
             prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).commit()
             return null
         }
@@ -47,20 +47,45 @@ class SecureCredentialStore(context: Context) {
         clearLegacyTokens()
     }
 
-    private fun persistEncrypted(token: String) {
+    @Synchronized
+    fun writeRefreshToken(token: String) {
+        require(token.isNotBlank()) { "Refresh token must not be blank" }
+        persistEncrypted(token, KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)
+        check(decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV) == token) { "Secure refresh-token readback failed" }
+    }
+
+    @Synchronized
+    fun readRefreshToken(): String? =
+        decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)?.takeIf { it.isNotBlank() }
+
+    @Synchronized
+    fun clearRefreshToken() {
+        prefs.edit().remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).commit()
+    }
+
+    @Synchronized
+    fun clearSessionTokens() {
+        prefs.edit()
+            .remove(KEY_CIPHERTEXT).remove(KEY_IV)
+            .remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV)
+            .commit()
+        clearLegacyTokens()
+    }
+
+    private fun persistEncrypted(token: String, ciphertextKey: String, ivKey: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val ciphertext = cipher.doFinal(token.toByteArray(Charsets.UTF_8))
         val saved = prefs.edit()
-            .putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-            .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .putString(ciphertextKey, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .putString(ivKey, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .commit()
         check(saved) { "Unable to persist secure access token" }
     }
 
-    private fun decryptStored(): String? {
-        val ciphertext = prefs.getString(KEY_CIPHERTEXT, null)?.takeIf { it.isNotBlank() } ?: return null
-        val iv = prefs.getString(KEY_IV, null)?.takeIf { it.isNotBlank() } ?: return null
+    private fun decryptStored(ciphertextKey: String, ivKey: String): String? {
+        val ciphertext = prefs.getString(ciphertextKey, null)?.takeIf { it.isNotBlank() } ?: return null
+        val iv = prefs.getString(ivKey, null)?.takeIf { it.isNotBlank() } ?: return null
         return runCatching {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(
@@ -112,6 +137,8 @@ class SecureCredentialStore(context: Context) {
         private const val PREFS = "grafit_secure_credentials"
         private const val KEY_CIPHERTEXT = "access_token_ciphertext_v1"
         private const val KEY_IV = "access_token_iv_v1"
+        private const val KEY_REFRESH_CIPHERTEXT = "refresh_token_ciphertext_v1"
+        private const val KEY_REFRESH_IV = "refresh_token_iv_v1"
         private const val KEY_ALIAS = "grafit_access_token_aes_v1"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"

@@ -1,5 +1,3 @@
-import java.time.Instant
-
 plugins {
     id("com.android.application")
     id("com.google.gms.google-services")
@@ -42,10 +40,9 @@ android {
         minSdk = 28
         targetSdk = 36
 
-        val dynamicVersionCode = ((Instant.now().epochSecond / 60L).toInt()).coerceAtLeast(1)
-        val dynamicVersionName = "1.2.dev.${dynamicVersionCode}"
-        versionCode = dynamicVersionCode
-        versionName = dynamicVersionName
+        // Release identity is source-controlled. Bump these Gradle properties explicitly for a new release.
+        versionCode = providers.gradleProperty("GRAFIT_VERSION_CODE").get().toInt()
+        versionName = providers.gradleProperty("GRAFIT_VERSION_NAME").get()
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

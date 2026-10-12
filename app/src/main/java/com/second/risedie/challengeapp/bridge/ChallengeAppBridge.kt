@@ -21,6 +21,7 @@ import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import com.second.risedie.challengeapp.sync.HealthSyncLogger
 import com.second.risedie.challengeapp.push.PushTokenRegistrar
+import com.second.risedie.challengeapp.security.NativeAuthSession
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +69,7 @@ class ChallengeAppBridge(
     private val healthRepository = HealthConnectRepository(context, healthSyncLogger)
     private val liveStepTracker = LiveStepTracker(context)
     private val foregroundSyncEngine = ForegroundHealthSyncEngine(context, liveStepTracker) { eventJson -> onActivitySyncJavascript(eventJson) }
+    private val nativeAuthSession = NativeAuthSession(context)
 
     @Volatile
     private var cachedPermissionPayload: String = permissionPayload(
@@ -260,6 +262,20 @@ class ChallengeAppBridge(
         }
         return JSONObject().put("opened", false).put("action_id", id).put("message", "Не удалось открыть безопасное действие.").toString()
     }
+
+    @JavascriptInterface
+    fun storeRefreshToken(token: String?): String = JSONObject()
+        .put("stored", nativeAuthSession.storeRefreshToken(token))
+        .toString()
+
+    @JavascriptInterface
+    fun clearAuthSession(): String {
+        nativeAuthSession.clear()
+        return JSONObject().put("cleared", true).toString()
+    }
+
+    @JavascriptInterface
+    fun refreshAccessToken(apiBase: String?): String = nativeAuthSession.refresh(apiBase)
 
     @JavascriptInterface
     fun configureNativeHealthSync(token: String?, apiBase: String?, sourceId: String?): String {
