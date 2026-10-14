@@ -70,7 +70,17 @@ android {
             )
         }
 
+        // Dedicated installable target for on-device instrumentation. The ordinary
+        // debug variant stays disabled so release/deployment behavior is unchanged.
+        create("instrumentation") {
+            initWith(getByName("release"))
+            isDebuggable = true
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
+
+    testBuildType = "instrumentation"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -109,4 +119,7 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:core-ktx:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

@@ -10,6 +10,8 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import com.second.risedie.challengeapp.security.PlayIntegrityTokenProvider
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
+import com.second.risedie.challengeapp.security.SecureCredentialStore
+import com.second.risedie.challengeapp.security.NativeAuthSession
 import java.net.URL
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -20,6 +22,8 @@ class HealthSyncApiClient(
     context: Context,
     private val logger: HealthSyncLogger,
 ) {
+    private val credentials = SecureCredentialStore(context.applicationContext)
+    private val auth = NativeAuthSession(context.applicationContext)
     private val playIntegrity = PlayIntegrityTokenProvider(context.applicationContext)
     @Volatile private var lastHttpCode: Int? = null
     @Volatile private var sourceSyncHttpCode: Int? = null
@@ -67,14 +71,33 @@ class HealthSyncApiClient(
     }
 
     fun postSourceSync(config: HealthSyncConfig, body: JSONObject, serverDay: String, sessionId: String): JSONObject {
+        ActivityBatchEnvelope.prepare(body)
+        val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId)
+        if (pending != null) {
+            val response = sendSourceSync(config, pending, pending.optString("server_day", serverDay), sessionId)
+            if (pending.optString("idempotency_key") == body.optString("idempotency_key")) return response
+        }
+        // Commit the frozen payload/key before the first network attempt, including nonce acquisition.
+        credentials.writePendingActivityBatch(ActivityBatchEnvelope.stored(config.apiBase, config.sourceId, body))
+        return sendSourceSync(config, body, serverDay, sessionId)
+    }
+
+    fun retryPendingSourceSync(config: HealthSyncConfig, sessionId: String) {
+        val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId) ?: return
+        sendSourceSync(config, pending, pending.optString("server_day"), sessionId)
+    }
+
+    private fun sendSourceSync(config: HealthSyncConfig, body: JSONObject, serverDay: String, sessionId: String): JSONObject {
         attachPayloadSecurityIfNeeded(config, body, serverDay, sessionId)
-        return postJsonForResponse(
-            "${config.apiBase}/api/v1/me/sources/sync",
-            config.token,
-            body,
-            sessionId,
-            "source_sync",
+        val response = postJsonForResponse(
+            "${config.apiBase}/api/v1/me/sources/sync", config.token, body, sessionId, "source_sync",
         )
+        if (!response.optBoolean("success") || response.optJSONObject("data")?.optLong("batch_id", 0L)?.let { it > 0L } != true) {
+            throw java.io.IOException("Missing source-sync acknowledgement")
+        }
+        // A lost 202 or process death leaves the same envelope for the next attempt.
+        credentials.clearPendingActivityBatch()
+        return response
     }
 
     fun postDayClose(config: HealthSyncConfig, body: JSONObject, sessionId: String): JSONObject =
@@ -95,6 +118,7 @@ class HealthSyncApiClient(
         // Every source-sync payload, including the aggregate snapshot, is bound to a
         // one-time nonce and the exact canonical request body. Detail windows are not
         // a privileged security path anymore.
+        listOf("nonce", "payload_signature", "signature", "play_integrity_token", "play_integrity").forEach(body::remove)
         val nonceResponse = postJsonForResponse(
             "${config.apiBase}/api/v1/me/activity/payload-nonce",
             config.token,
@@ -102,10 +126,10 @@ class HealthSyncApiClient(
             sessionId,
             "payload_nonce",
         )
-        val data = nonceResponse.optJSONObject("data") ?: return
+        val data = nonceResponse.optJSONObject("data") ?: throw java.io.IOException("Missing payload nonce")
         val nonce = data.optString("nonce")
         val signingKey = data.optString("payload_signing_key")
-        if (nonce.isBlank() || signingKey.isBlank()) return
+        if (nonce.isBlank() || signingKey.isBlank()) throw java.io.IOException("Incomplete payload nonce")
         body.put("nonce", nonce)
         body.put("payload_signature", hmacSha256Hex(canonicalActivityPayload(body, data), signingKey))
 
@@ -159,13 +183,14 @@ class HealthSyncApiClient(
 
     private fun openConnection(url: String, token: String, method: String): HttpURLConnection {
         require(TrustedWebOrigin.isTrustedUrl(url)) { "Refusing request to untrusted API origin" }
+        val accessToken = credentials.readAccessToken() ?: throw IllegalStateException("Native session is missing")
         return (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = false
             requestMethod = method
             connectTimeout = 10_000
             readTimeout = 20_000
             setRequestProperty("Accept", "application/json")
-            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Authorization", "Bearer $accessToken")
             if (method == "POST") setRequestProperty("Content-Type", "application/json")
         }
     }
@@ -175,13 +200,23 @@ class HealthSyncApiClient(
         body: JSONObject?,
         sessionId: String,
         operation: String,
+        canRefresh: Boolean = true,
     ): JSONObject {
+        val sentToken = connection.getRequestProperty("Authorization")?.removePrefix("Bearer ")
         val started = System.nanoTime()
         try {
             if (body != null) {
                 OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
             }
             val code = connection.responseCode
+            if (code == 401 && canRefresh) {
+                val refreshed = JSONObject(auth.refresh(sentToken)).optBoolean("ok")
+                if (refreshed) {
+                    val retry = openConnection(connection.url.toString(), "", connection.requestMethod)
+                    if (body != null) retry.doOutput = true
+                    return execute(retry, body, sessionId, operation, canRefresh = false)
+                }
+            }
             lastHttpCode = code
             if (operation == "source_sync") sourceSyncHttpCode = code
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
@@ -194,7 +229,14 @@ class HealthSyncApiClient(
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000)
             logger.info(sessionId, COMPONENT, "http_response", responseFields)
             if (body != null) logger.info(sessionId, COMPONENT, "http_upload_completed", responseFields)
-            if (code !in 200..299) throw IllegalStateException("$operation failed with HTTP $code")
+            if (code !in 200..299) {
+                // A definitive ingress rejection cannot be repaired by retrying a frozen body.
+                // Keep uncertain deliveries, authentication failures and retryable server errors.
+                if (operation == "source_sync" && code in setOf(400, 404, 409, 413, 422)) {
+                    credentials.clearPendingActivityBatch()
+                }
+                throw IllegalStateException("$operation failed with HTTP $code")
+            }
             return if (text.isBlank()) JSONObject() else JSONObject(text)
         } catch (error: Throwable) {
             logger.error(sessionId, COMPONENT, "http_failed", error, JSONObject().put("operation", operation))

@@ -21,7 +21,6 @@ class HealthSyncConfigStore(context: Context) {
         require(token.isNotBlank()) { "Missing native API token" }
         require(sourceId > 0L) { "Invalid activity source" }
 
-        credentials.writeAccessToken(token)
         prefs.edit()
             .remove(KEY_TOKEN)
             .putString(KEY_API_BASE, trustedApiBase)

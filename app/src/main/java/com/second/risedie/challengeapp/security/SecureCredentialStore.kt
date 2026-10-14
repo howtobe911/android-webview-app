@@ -21,8 +21,37 @@ class SecureCredentialStore(context: Context) {
     private val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     @Synchronized
+    fun writeSessionTokens(accessToken: String, refreshToken: String) {
+        require(accessToken.isNotBlank() && refreshToken.isNotBlank())
+        // One encrypted envelope commits both rotated tokens atomically.
+        persistEncrypted(org.json.JSONObject().put("access", accessToken).put("refresh", refreshToken).toString(), KEY_SESSION, KEY_SESSION_IV)
+        check(readAccessToken() == accessToken && readRefreshToken() == refreshToken) { "Secure session readback failed" }
+        prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).commit()
+        clearLegacyTokens()
+    }
+
+    private fun sessionToken(field: String): String? = decryptStored(KEY_SESSION, KEY_SESSION_IV)?.let {
+        runCatching { org.json.JSONObject(it).optString(field).takeIf(String::isNotBlank) }.getOrNull()
+    }
+
+    @Synchronized
+    fun writePendingActivityBatch(value: String) = persistEncrypted(value, KEY_PENDING, KEY_PENDING_IV)
+
+    @Synchronized
+    fun readPendingActivityBatch(): String? = decryptStored(KEY_PENDING, KEY_PENDING_IV)
+
+    @Synchronized
+    fun clearPendingActivityBatch() {
+        prefs.edit().remove(KEY_PENDING).remove(KEY_PENDING_IV).commit()
+    }
+
+    @Synchronized
     fun writeAccessToken(token: String) {
         require(token.isNotBlank()) { "Access token must not be blank" }
+        if (sessionToken("refresh") != null) {
+            writeSessionTokens(token, requireNotNull(sessionToken("refresh")))
+            return
+        }
         persistEncrypted(token, KEY_CIPHERTEXT, KEY_IV)
         check(decryptStored(KEY_CIPHERTEXT, KEY_IV) == token) { "Secure access-token readback failed" }
         clearLegacyTokens()
@@ -30,6 +59,7 @@ class SecureCredentialStore(context: Context) {
 
     @Synchronized
     fun readAccessToken(): String? {
+        sessionToken("access")?.let { return it }
         decryptStored(KEY_CIPHERTEXT, KEY_IV)?.takeIf { it.isNotBlank() }?.let { return it }
         val legacy = readLegacyToken() ?: return null
         persistEncrypted(legacy, KEY_CIPHERTEXT, KEY_IV)
@@ -43,24 +73,28 @@ class SecureCredentialStore(context: Context) {
 
     @Synchronized
     fun clearAccessToken() {
-        prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).commit()
+        prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).remove(KEY_SESSION).remove(KEY_SESSION_IV).commit()
         clearLegacyTokens()
     }
 
     @Synchronized
     fun writeRefreshToken(token: String) {
         require(token.isNotBlank()) { "Refresh token must not be blank" }
+        if (sessionToken("access") != null) {
+            writeSessionTokens(requireNotNull(sessionToken("access")), token)
+            return
+        }
         persistEncrypted(token, KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)
         check(decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV) == token) { "Secure refresh-token readback failed" }
     }
 
     @Synchronized
     fun readRefreshToken(): String? =
-        decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)?.takeIf { it.isNotBlank() }
+        sessionToken("refresh") ?: decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)?.takeIf { it.isNotBlank() }
 
     @Synchronized
     fun clearRefreshToken() {
-        prefs.edit().remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).commit()
+        prefs.edit().remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).remove(KEY_SESSION).remove(KEY_SESSION_IV).commit()
     }
 
     @Synchronized
@@ -68,6 +102,7 @@ class SecureCredentialStore(context: Context) {
         prefs.edit()
             .remove(KEY_CIPHERTEXT).remove(KEY_IV)
             .remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV)
+            .remove(KEY_SESSION).remove(KEY_SESSION_IV).remove(KEY_PENDING).remove(KEY_PENDING_IV)
             .commit()
         clearLegacyTokens()
     }
@@ -135,6 +170,10 @@ class SecureCredentialStore(context: Context) {
 
     companion object {
         private const val PREFS = "grafit_secure_credentials"
+        private const val KEY_SESSION = "session_ciphertext_v2"
+        private const val KEY_SESSION_IV = "session_iv_v2"
+        private const val KEY_PENDING = "pending_activity_ciphertext_v1"
+        private const val KEY_PENDING_IV = "pending_activity_iv_v1"
         private const val KEY_CIPHERTEXT = "access_token_ciphertext_v1"
         private const val KEY_IV = "access_token_iv_v1"
         private const val KEY_REFRESH_CIPHERTEXT = "refresh_token_ciphertext_v1"

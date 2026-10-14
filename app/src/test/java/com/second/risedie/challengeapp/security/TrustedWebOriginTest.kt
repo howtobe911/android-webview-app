@@ -42,7 +42,7 @@ class TrustedWebOriginTest {
         val push = source("app/src/main/java/com/second/risedie/challengeapp/push/PushTokenRegistrar.kt")
 
         assertTrue(bridge.contains("TrustedWebOrigin.canonicalOrigin"))
-        assertTrue(api.contains("TrustedWebOrigin.canonicalOrigin"))
+        assertTrue(api.contains("TrustedWebOrigin.isTrustedUrl"))
         assertTrue(api.contains("instanceFollowRedirects = false"))
         assertTrue(push.contains("TrustedWebOrigin.canonicalOrigin"))
     }

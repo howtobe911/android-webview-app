@@ -58,6 +58,7 @@ class HealthSyncCoordinator(context: Context) {
             val syncWindow = apiClient.fetchSyncWindow(config, sessionId)
             require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
 
+            apiClient.retryPendingSourceSync(config, sessionId)
             postPreviousDayCloseSnapshotIfNeeded(config, syncWindow, sessionId)
 
             logger.info(sessionId, "health_reader", "read_started", JSONObject()

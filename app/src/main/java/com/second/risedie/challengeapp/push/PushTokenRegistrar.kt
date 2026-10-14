@@ -25,7 +25,6 @@ object PushTokenRegistrar {
         val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase) ?: return
         if (accessToken.isBlank()) return
 
-        SecureCredentialStore(context).writeAccessToken(accessToken)
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .remove(KEY_TOKEN)
             .putString(KEY_API_BASE, normalizedApiBase)

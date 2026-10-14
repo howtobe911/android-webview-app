@@ -22,6 +22,7 @@ import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import com.second.risedie.challengeapp.sync.HealthSyncLogger
 import com.second.risedie.challengeapp.push.PushTokenRegistrar
 import com.second.risedie.challengeapp.security.NativeAuthSession
+import com.second.risedie.challengeapp.security.SecureCredentialStore
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -264,9 +265,7 @@ class ChallengeAppBridge(
     }
 
     @JavascriptInterface
-    fun storeRefreshToken(token: String?): String = JSONObject()
-        .put("stored", nativeAuthSession.storeRefreshToken(token))
-        .toString()
+    fun authenticate(operation: String?, payload: String?): String = nativeAuthSession.authenticate(operation, payload)
 
     @JavascriptInterface
     fun clearAuthSession(): String {
@@ -275,13 +274,13 @@ class ChallengeAppBridge(
     }
 
     @JavascriptInterface
-    fun refreshAccessToken(apiBase: String?): String = nativeAuthSession.refresh(apiBase)
+    fun refreshAccessToken(): String = nativeAuthSession.refresh()
 
     @JavascriptInterface
-    fun configureNativeHealthSync(token: String?, apiBase: String?, sourceId: String?): String {
+    fun configureNativeHealthSync(sourceId: String?): String {
         healthSyncLogger.info("configuration", "bridge", "configure_requested")
-        val normalizedToken = token?.trim().orEmpty()
-        val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(apiBase)
+        val normalizedToken = SecureCredentialStore(context).readAccessToken().orEmpty()
+        val normalizedApiBase = TrustedWebOrigin.canonicalOrigin(BuildConfig.APP_WEB_URL)
         val normalizedSourceId = sourceId?.trim()?.toLongOrNull() ?: 0L
 
         if (normalizedToken.isBlank() || normalizedApiBase == null || normalizedSourceId <= 0L) {

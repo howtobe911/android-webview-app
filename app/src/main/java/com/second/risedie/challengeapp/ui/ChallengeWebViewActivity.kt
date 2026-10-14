@@ -31,6 +31,7 @@ import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
 import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
+import com.second.risedie.challengeapp.security.NativeAuthSession
 import com.second.risedie.challengeapp.push.GraFitFirebaseMessagingService
 import org.json.JSONObject
 
@@ -117,19 +118,25 @@ class ChallengeWebViewActivity : ComponentActivity() {
         configureWebView(webView)
         webView.addJavascriptInterface(bridge, "ChallengeAppBridge")
 
-        if (savedInstanceState == null) {
-            val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
-                .buildUpon()
-                .appendQueryParameter("app_version", BuildConfig.VERSION_NAME)
-                .appendQueryParameter("app_build", BuildConfig.VERSION_CODE.toString())
-                .build()
-                .toString()
-            val resolvedLaunchUrl = resolvePushLaunchUrl(launchUrl, intent)
-            if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
-            webView.loadUrl(resolvedLaunchUrl)
-        } else {
-            webView.restoreState(savedInstanceState)
-        }
+        Thread {
+            runCatching { NativeAuthSession(applicationContext).restoreWebSession() }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (savedInstanceState == null) {
+                    val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
+                        .buildUpon()
+                        .appendQueryParameter("app_version", BuildConfig.VERSION_NAME)
+                        .appendQueryParameter("app_build", BuildConfig.VERSION_CODE.toString())
+                        .build()
+                        .toString()
+                    val resolvedLaunchUrl = resolvePushLaunchUrl(launchUrl, intent)
+                    if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
+                    webView.loadUrl(resolvedLaunchUrl)
+                } else {
+                    webView.restoreState(savedInstanceState)
+                }
+            }
+        }.start()
 
         onBackPressedDispatcher.addCallback(this) {
             if (webView.canGoBack()) {
