@@ -46,6 +46,10 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
+    private var trustedDocumentReady = false
+    private var webSessionRestored = false
+    private var internalNavigationSequence = 0
+    private var pendingInternalRoute: String? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
 
     private val healthPermissionLauncher =
@@ -122,6 +126,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             runCatching { NativeAuthSession(applicationContext).restoreWebSession() }
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
+                webSessionRestored = true
                 if (savedInstanceState == null) {
                     val launchUrl = Uri.parse(BuildConfig.APP_WEB_URL)
                         .buildUpon()
@@ -134,7 +139,9 @@ class ChallengeWebViewActivity : ComponentActivity() {
                     webView.loadUrl(resolvedLaunchUrl)
                 } else {
                     webView.restoreState(savedInstanceState)
+                    pendingInternalRoute?.let { navigateInternalOrLoad(it) }
                 }
+                pendingInternalRoute = null
             }
         }.start()
 
@@ -165,7 +172,40 @@ class ChallengeWebViewActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         val route = sanitizePushRoute(intent.getStringExtra(EXTRA_PUSH_ROUTE) ?: intent.getStringExtra("route")) ?: return
-        webView.loadUrl(Uri.parse(BuildConfig.APP_WEB_URL).buildUpon().encodedPath(route).build().toString())
+        navigateInternalOrLoad(route)
+    }
+
+    private fun navigateInternalOrLoad(rawRoute: String) {
+        val route = sanitizePushRoute(rawRoute) ?: return
+        // A push arriving during cold auth restore is consumed by the initial load.
+        if (!webSessionRestored) { pendingInternalRoute = route; return }
+        val target = Uri.parse(route)
+        val url = Uri.parse(BuildConfig.APP_WEB_URL).buildUpon()
+            .encodedPath(target.encodedPath).encodedQuery(target.encodedQuery)
+            .encodedFragment(target.encodedFragment).build().toString()
+        if (!isAllowedInternalUrl(Uri.parse(url))) return
+        val navigationId = ++internalNavigationSequence
+        val fallback = {
+            if (navigationId == internalNavigationSequence && !isFinishing && !isDestroyed) webView.loadUrl(url)
+        }
+        val current = webView.url
+        if (!trustedDocumentReady || current == null || !isAllowedInternalUrl(Uri.parse(current))) {
+            fallback(); return
+        }
+        val quotedRoute = JSONObject.quote(route)
+        val quotedUrl = JSONObject.quote(url)
+        val script = """
+            (function() {
+                try {
+                    if (document.readyState === 'loading' || typeof window.GrafitNavigateInternal !== 'function') return false;
+                    window.GrafitNavigateInternal($quotedRoute, {fallback:true}).catch(function() { window.location.assign($quotedUrl); });
+                    return true;
+                } catch (_) { return false; }
+            })();
+        """.trimIndent()
+        try {
+            webView.evaluateJavascript(script) { result -> if (result != "true") fallback() }
+        } catch (_: Exception) { fallback() }
     }
 
     private fun createNotificationChannel() {
@@ -251,8 +291,14 @@ class ChallengeWebViewActivity : ComponentActivity() {
                 }
             }
 
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                trustedDocumentReady = false
+                super.onPageStarted(view, url, favicon)
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                trustedDocumentReady = url != null && isAllowedInternalUrl(Uri.parse(url))
                 if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:onPageFinished url=$url")
                 notifyBridgeReady()
             }
@@ -264,6 +310,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             ) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
+                    trustedDocumentReady = false
                     dispatchJavascriptEvent(
                         JSONObject()
                             .put("available", true)
