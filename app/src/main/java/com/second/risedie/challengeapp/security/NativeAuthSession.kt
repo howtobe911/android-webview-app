@@ -6,55 +6,71 @@ import com.second.risedie.challengeapp.BuildConfig
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicLong
 
 /** Existing device login/refresh, with credentials kept out of the JavaScript response. */
 class NativeAuthSession(context: Context) {
+    private val appContext = context.applicationContext
     private val credentials = SecureCredentialStore(context.applicationContext)
     private val origin = requireNotNull(TrustedWebOrigin.canonicalOrigin(BuildConfig.APP_WEB_URL))
 
-    fun authenticate(operation: String?, payloadJson: String?): String = synchronized(sessionLock) {
-        if (operation !in setOf("login", "register")) return@synchronized result(false, "invalid_operation")
-        val input = runCatching { JSONObject(payloadJson.orEmpty()) }.getOrNull()
-            ?: return@synchronized result(false, "invalid_payload")
-        // A capability with a fixed endpoint and a narrow payload, never a raw-token setter.
-        val fields = setOf("login", "password", "nickname", "email", "personal_data_consent", "terms_accepted",
-            "legal_version", "install_uuid", "device_name", "device_model", "platform", "app_version", "os_version", "push_token")
-        val body = JSONObject()
-        fields.forEach { if (input.has(it)) body.put(it, input.get(it)) }
-        val reply = exchange(operation!!, body) ?: return@synchronized result(false, "network_error")
-        val status = reply.first
-        val payload = reply.second
-        if (status in 200..299) {
-            if (!acceptCredentials(payload)) return@synchronized result(false, "invalid_response")
-            credentials.clearPendingActivityBatch()
+    fun authenticate(operation: String?, payloadJson: String?): String {
+        val generation = sessionGeneration()
+        return synchronized(sessionLock) {
+            if (generation != sessionGeneration()) return@synchronized result(false, "session_changed")
+            if (operation !in setOf("login", "register")) return@synchronized result(false, "invalid_operation")
+            val input = runCatching { JSONObject(payloadJson.orEmpty()) }.getOrNull()
+                ?: return@synchronized result(false, "invalid_payload")
+            // A capability with a fixed endpoint and a narrow payload, never a raw-token setter.
+            val fields = setOf("login", "password", "nickname", "email", "personal_data_consent", "terms_accepted",
+                "legal_version", "install_uuid", "device_name", "device_model", "platform", "app_version", "os_version", "push_token")
+            val body = JSONObject()
+            fields.forEach { if (input.has(it)) body.put(it, input.get(it)) }
+            val reply = exchange(operation!!, body) ?: return@synchronized result(false, "network_error")
+            if (generation != sessionGeneration()) return@synchronized result(false, "session_changed")
+            val status = reply.first
+            val payload = reply.second
+            if (status in 200..299) {
+                val loginGeneration = invalidateSession()
+                clearSyncConfiguration()
+                if (!acceptCredentials(payload, loginGeneration)) return@synchronized result(false, "invalid_response")
+                credentials.clearPendingActivityBatch()
+            }
+            // Both success and error bodies are sanitized before crossing the bridge.
+            payload.optJSONObject("data")?.remove("token")
+            payload.optJSONObject("data")?.remove("refresh_token")
+            JSONObject().put("ok", status in 200..299).put("status", status).put("payload", payload).toString()
         }
-        // Both success and error bodies are sanitized before crossing the bridge.
-        payload.optJSONObject("data")?.remove("token")
-        payload.optJSONObject("data")?.remove("refresh_token")
-        JSONObject().put("ok", status in 200..299).put("status", status).put("payload", payload).toString()
     }
 
-    fun refresh(failedToken: String? = null): String = synchronized(sessionLock) {
-        val current = credentials.readAccessToken()
-        if (failedToken != null && current != null && current != failedToken) {
-            installWebCookie(current)
-            return@synchronized result(true, null)
+
+    fun refresh(failedToken: String? = null, expectedGeneration: Long? = null): String {
+        val generation = expectedGeneration ?: sessionGeneration()
+        return synchronized(sessionLock) {
+            if (generation != sessionGeneration() || !isSessionActive()) return@synchronized result(false, "session_changed")
+            val current = credentials.readAccessToken()
+            if (failedToken != null && current != null && current != failedToken) {
+                installWebCookie(current)
+                return@synchronized result(true, null)
+            }
+            val refreshToken = credentials.readRefreshToken()
+                ?: return@synchronized result(false, "refresh_token_missing")
+            val reply = exchange("refresh", JSONObject().put("refresh_token", refreshToken))
+                ?: return@synchronized result(false, "network_error")
+            if (generation != sessionGeneration()) return@synchronized result(false, "session_changed")
+            val status = reply.first
+            if (status !in 200..299) {
+                if (status == 401 || status == 403 || status == 422) clear()
+                return@synchronized result(false, if (status == 429 || status >= 500) "retryable" else "refresh_rejected")
+            }
+            if (!acceptCredentials(reply.second, generation)) {
+                clear()
+                return@synchronized result(false, "invalid_response")
+            }
+            result(true, null)
         }
-        val refreshToken = credentials.readRefreshToken()
-            ?: return@synchronized result(false, "refresh_token_missing")
-        val reply = exchange("refresh", JSONObject().put("refresh_token", refreshToken))
-            ?: return@synchronized result(false, "network_error")
-        val status = reply.first
-        if (status !in 200..299) {
-            if (status == 401 || status == 403 || status == 422) clear()
-            return@synchronized result(false, if (status == 429 || status >= 500) "retryable" else "refresh_rejected")
-        }
-        if (!acceptCredentials(reply.second)) {
-            clear()
-            return@synchronized result(false, "invalid_response")
-        }
-        result(true, null)
     }
+
 
     /** Invoked natively before the first document loads, never by a JS token setter. */
     fun restoreWebSession() = synchronized(sessionLock) {
@@ -63,17 +79,33 @@ class NativeAuthSession(context: Context) {
         if (access != null) installWebCookie(access) else clearWebCookie()
     }
 
-    fun clear() = synchronized(sessionLock) {
-        credentials.clearSessionTokens()
-        clearWebCookie()
+    fun clear() {
+        invalidateSession()
+        synchronized(sessionLock) {
+            credentials.clearSessionTokens()
+            clearSyncConfiguration()
+            clearWebCookie()
+        }
     }
 
-    private fun acceptCredentials(payload: JSONObject): Boolean {
+    private fun clearSyncConfiguration() {
+        appContext.getSharedPreferences("grafit_native_health_sync", Context.MODE_PRIVATE)
+            .edit().remove("source_id").remove("api_base").remove("last_successful_foreground_sync_at").commit()
+    }
+
+    private fun acceptCredentials(payload: JSONObject, expectedGeneration: Long): Boolean {
         val data = payload.optJSONObject("data") ?: return false
         val access = data.optString("token").trim()
         val refresh = data.optString("refresh_token").trim()
         if (access.isBlank() || refresh.isBlank()) return false
+        if (expectedGeneration != sessionGeneration()) return false
         credentials.writeSessionTokens(access, refresh)
+        if (expectedGeneration != sessionGeneration()) {
+            credentials.clearSessionTokens()
+            return false
+        }
+        // Setting an old generation cannot reactivate a concurrently invalidated session.
+        activeGeneration.set(expectedGeneration)
         installWebCookie(access)
         data.put("authenticated", true)
         return true
@@ -130,5 +162,14 @@ class NativeAuthSession(context: Context) {
     companion object {
         // Login, refresh and logout from WebView/background clients cannot rotate concurrently.
         private val sessionLock = Any()
+        private val generation = AtomicLong(0)
+        private val activeGeneration = AtomicLong(0)
+        fun sessionGeneration(): Long = generation.get()
+        fun isSessionActive(): Boolean = activeGeneration.get() == generation.get()
+        fun invalidateSession(): Long = generation.incrementAndGet()
+        fun <T> inSession(expected: Long, action: () -> T): T = synchronized(sessionLock) {
+            check(expected == sessionGeneration() && isSessionActive()) { "Native session changed" }
+            action()
+        }
     }
 }

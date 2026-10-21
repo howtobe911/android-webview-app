@@ -31,7 +31,10 @@ class HealthSyncApiClient(
     fun lastHttpCode(): Int? = lastHttpCode
     fun sourceSyncHttpCode(): Int? = sourceSyncHttpCode
     fun resetSourceSyncHttpCode() { sourceSyncHttpCode = null }
+    private var sessionGeneration = NativeAuthSession.sessionGeneration()
+
     fun fetchSyncWindow(config: HealthSyncConfig, sessionId: String): ServerSyncWindow {
+        sessionGeneration = config.sessionGeneration
         logger.info(sessionId, COMPONENT, "sync_window_request")
         val response = getJson("${config.apiBase}/api/v1/me/activity/sync-window", config.token, sessionId, "sync_window")
         val data = response.optJSONObject("data") ?: response
@@ -78,7 +81,8 @@ class HealthSyncApiClient(
             if (pending.optString("idempotency_key") == body.optString("idempotency_key")) return response
         }
         // Commit the frozen payload/key before the first network attempt, including nonce acquisition.
-        credentials.writePendingActivityBatch(ActivityBatchEnvelope.stored(config.apiBase, config.sourceId, body))
+        check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
+        NativeAuthSession.inSession(sessionGeneration) { credentials.writePendingActivityBatch(ActivityBatchEnvelope.stored(config.apiBase, config.sourceId, body)) }
         return sendSourceSync(config, body, serverDay, sessionId)
     }
 
@@ -96,7 +100,7 @@ class HealthSyncApiClient(
             throw java.io.IOException("Missing source-sync acknowledgement")
         }
         // A lost 202 or process death leaves the same envelope for the next attempt.
-        credentials.clearPendingActivityBatch()
+        if (sessionGeneration == NativeAuthSession.sessionGeneration()) NativeAuthSession.inSession(sessionGeneration) { credentials.clearPendingActivityBatch() }
         return response
     }
 
@@ -182,8 +186,10 @@ class HealthSyncApiClient(
     }
 
     private fun openConnection(url: String, token: String, method: String): HttpURLConnection {
+        check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
         require(TrustedWebOrigin.isTrustedUrl(url)) { "Refusing request to untrusted API origin" }
-        val accessToken = credentials.readAccessToken() ?: throw IllegalStateException("Native session is missing")
+        val accessToken = NativeAuthSession.inSession(sessionGeneration) { credentials.readAccessToken() }
+            ?: throw IllegalStateException("Native session is missing")
         return (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = false
             requestMethod = method
@@ -205,12 +211,13 @@ class HealthSyncApiClient(
         val sentToken = connection.getRequestProperty("Authorization")?.removePrefix("Bearer ")
         val started = System.nanoTime()
         try {
+            check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
             if (body != null) {
                 OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
             }
             val code = connection.responseCode
             if (code == 401 && canRefresh) {
-                val refreshed = JSONObject(auth.refresh(sentToken)).optBoolean("ok")
+                val refreshed = JSONObject(auth.refresh(sentToken, sessionGeneration)).optBoolean("ok")
                 if (refreshed) {
                     val retry = openConnection(connection.url.toString(), "", connection.requestMethod)
                     if (body != null) retry.doOutput = true
@@ -233,7 +240,10 @@ class HealthSyncApiClient(
                 // A definitive ingress rejection cannot be repaired by retrying a frozen body.
                 // Keep uncertain deliveries, authentication failures and retryable server errors.
                 if (operation == "source_sync" && code in setOf(400, 404, 409, 413, 422)) {
-                    credentials.clearPendingActivityBatch()
+                    if (sessionGeneration == NativeAuthSession.sessionGeneration()) NativeAuthSession.inSession(sessionGeneration) { credentials.clearPendingActivityBatch() }
+                }
+                if (code in setOf(408, 425, 429) || code >= 500) {
+                    throw java.io.IOException("$operation temporarily failed with HTTP $code")
                 }
                 throw IllegalStateException("$operation failed with HTTP $code")
             }

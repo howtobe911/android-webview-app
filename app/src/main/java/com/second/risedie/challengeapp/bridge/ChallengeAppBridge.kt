@@ -10,7 +10,6 @@ import android.os.PowerManager
 import android.os.ext.SdkExtensions
 import android.provider.Settings
 import android.util.Log
-import android.webkit.JavascriptInterface
 import androidx.activity.ComponentActivity
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
@@ -50,7 +49,7 @@ class ChallengeAppBridge(
     private val onPrerequisitesJavascript: (String) -> Unit,
     private val onBackgroundReadinessJavascript: (String) -> Unit,
     private val onLaunchNotificationPermission: () -> Unit,
-) {
+) : NativeBridgeEndpoint {
     private val context: Context = activity.applicationContext
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val permissionFlowInProgress = AtomicBoolean(false)
@@ -83,7 +82,7 @@ class ChallengeAppBridge(
     init {
         logDebug("bridge:init")
         emitDebugEvent("bridge:init", mapOf("sdkStatus" to sdkStatus(), "activityRecognitionGranted" to isActivityRecognitionGranted()))
-        if (isActivityRecognitionGranted()) liveStepTracker.start()
+        if (hasNativeSession() && isActivityRecognitionGranted()) liveStepTracker.start() else liveStepTracker.stop()
         refreshPermissionState(notifyJavascript = false, enqueueNativeSync = false)
     }
 
@@ -107,12 +106,10 @@ class ChallengeAppBridge(
     private val healthClient: HealthConnectClient?
         get() = healthRepository.clientOrNull()
 
-    @JavascriptInterface
     fun getHealthSyncLog(): String = JSONObject()
         .put("content", healthSyncLogger.tail(400))
         .toString()
 
-    @JavascriptInterface
     fun clearHealthSyncLog(): String {
         val cleared = healthSyncLogger.clear()
         return JSONObject()
@@ -121,7 +118,6 @@ class ChallengeAppBridge(
             .toString()
     }
 
-    @JavascriptInterface
     fun shareHealthSyncLog(): String {
         val shared = healthSyncLogger.share(activity)
         return JSONObject()
@@ -130,7 +126,6 @@ class ChallengeAppBridge(
             .toString()
     }
 
-    @JavascriptInterface
     fun getBridgeInfo(): String {
         val status = sdkStatus()
         return JSONObject()
@@ -155,13 +150,10 @@ class ChallengeAppBridge(
     }
 
 
-    @JavascriptInterface
     fun getActivityPrerequisites(): String = activityPrerequisitesPayload().toString()
 
-    @JavascriptInterface
     fun getBackgroundActivityReadiness(): String = backgroundActivityReadinessPayload().toString()
 
-    @JavascriptInterface
     fun openBackgroundActivitySettings(): String {
         val packageUri = Uri.parse("package:${context.packageName}")
         val candidates = listOf(
@@ -185,7 +177,6 @@ class ChallengeAppBridge(
             .toString()
     }
 
-    @JavascriptInterface
     fun getBatteryOptimizationState(): String {
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val provider = activityProviderPackages().firstOrNull { isPackageInstalled(it.first) }
@@ -206,7 +197,6 @@ class ChallengeAppBridge(
             .toString()
     }
 
-    @JavascriptInterface
     fun openBatterySettingsFor(target: String?): String {
         val provider = activityProviderPackages().firstOrNull { isPackageInstalled(it.first) }
         val packageName = when (target?.trim()) {
@@ -221,7 +211,6 @@ class ChallengeAppBridge(
         return JSONObject().put("opened", false).put("message", "Не удалось открыть настройки батареи.").toString()
     }
 
-    @JavascriptInterface
     fun performActivityPrerequisiteAction(actionId: String?): String {
         val id = actionId?.trim().orEmpty()
         val packageName = when (id) {
@@ -264,19 +253,37 @@ class ChallengeAppBridge(
         return JSONObject().put("opened", false).put("action_id", id).put("message", "Не удалось открыть безопасное действие.").toString()
     }
 
-    @JavascriptInterface
-    fun authenticate(operation: String?, payload: String?): String = nativeAuthSession.authenticate(operation, payload)
+    @Volatile private var sessionEnding = false
+    fun authenticate(operation: String?, payload: String?): String {
+        val result = nativeAuthSession.authenticate(operation, payload)
+        if (runCatching { JSONObject(result).optBoolean("ok") }.getOrDefault(false)) sessionEnding = false
+        return result
+    }
 
-    @JavascriptInterface
+    override fun endWebSession() {
+        sessionEnding = true
+        NativeAuthSession.invalidateSession()
+        foregroundSyncEngine.cancelSession()
+        liveStepTracker.stop()
+        HealthSyncWorker.cancelAll(context)
+        PushTokenRegistrar.clear(context)
+    }
+
+    fun onPermissionLaunchAborted() {
+        permissionFlowInProgress.set(false)
+        notificationPermissionInProgress.set(false)
+        permissionRequestStage.set(PermissionRequestStage.NONE)
+    }
+
+    override fun hasNativeSession(): Boolean = !sessionEnding && NativeAuthSession.isSessionActive() && SecureCredentialStore(context).readAccessToken() != null
+
     fun clearAuthSession(): String {
         nativeAuthSession.clear()
         return JSONObject().put("cleared", true).toString()
     }
 
-    @JavascriptInterface
     fun refreshAccessToken(): String = nativeAuthSession.refresh()
 
-    @JavascriptInterface
     fun configureNativeHealthSync(sourceId: String?): String {
         healthSyncLogger.info("configuration", "bridge", "configure_requested")
         val normalizedToken = SecureCredentialStore(context).readAccessToken().orEmpty()
@@ -311,13 +318,11 @@ class ChallengeAppBridge(
 
 
 
-    @JavascriptInterface
     fun clearNativePushRegistration(): String {
         PushTokenRegistrar.clear(context)
         return JSONObject().put("cleared", true).toString()
     }
 
-    @JavascriptInterface
     fun resetLiveAnchorFromServer(activityDate: String?, serverSteps: String?, recordedAt: String?): String {
         val day = activityDate?.trim().orEmpty()
         val steps = serverSteps?.trim()?.toLongOrNull() ?: 0L
@@ -330,23 +335,19 @@ class ChallengeAppBridge(
             .toString()
     }
 
-    @JavascriptInterface
     fun triggerNativeHealthSync(): String {
         return requestForegroundSync("manual_refresh")
     }
 
-    @JavascriptInterface
     fun requestForegroundSync(reason: String?): String {
         return foregroundSyncEngine.requestForegroundSync(reason?.trim().orEmpty()).toString()
     }
 
-    @JavascriptInterface
     fun getPermissionState(): String {
         refreshPermissionState(notifyJavascript = false, enqueueNativeSync = false)
         return cachedPermissionPayload
     }
 
-    @JavascriptInterface
     fun requestActivityPermissions(): String {
         logDebug("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
         emitDebugEvent("permissions:request:start", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
@@ -358,7 +359,6 @@ class ChallengeAppBridge(
         return requestHealthSourcePermissions()
     }
 
-    @JavascriptInterface
     fun requestPhysicalActivityPermission(): String {
         logDebug("permissions:physical:request", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted()))
         emitDebugEvent("permissions:physical:request", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted()))
@@ -386,7 +386,6 @@ class ChallengeAppBridge(
         return payload
     }
 
-    @JavascriptInterface
     fun requestHealthSourcePermissions(): String {
         healthSyncLogger.info("permissions", "bridge", "data_permission_requested")
         logDebug("permissions:source:request", mapOf("sdkStatus" to sdkStatus()))
@@ -487,7 +486,6 @@ class ChallengeAppBridge(
         }
     }
 
-    @JavascriptInterface
     fun requestBackgroundReadPermission(): String {
         healthSyncLogger.info("permissions", "bridge", "background_permission_requested")
         val supported = healthRepository.isBackgroundReadAvailable()
@@ -526,7 +524,6 @@ class ChallengeAppBridge(
         return true
     }
 
-    @JavascriptInterface
     fun requestNotificationPermission(): String {
         val required = notificationPermissionRequired()
         val granted = notificationPermissionGranted()
@@ -565,7 +562,7 @@ class ChallengeAppBridge(
 
     fun onActivityRecognitionPermissionResult(granted: Boolean) {
         healthSyncLogger.info("permissions", "bridge", "activity_recognition_result", JSONObject().put("granted", granted))
-        if (granted) liveStepTracker.start()
+        if (granted && hasNativeSession()) liveStepTracker.start() else liveStepTracker.stop()
         val payload = permissionPayload(
             available = sdkStatus() == HealthConnectClient.SDK_AVAILABLE,
             granted = healthConnectGrantedFromCache(),
@@ -582,7 +579,7 @@ class ChallengeAppBridge(
     }
 
     fun onHostResumed() {
-        if (isActivityRecognitionGranted()) liveStepTracker.start()
+        if (hasNativeSession() && isActivityRecognitionGranted()) liveStepTracker.start() else liveStepTracker.stop()
         foregroundSyncEngine.onAppBackground()
         emitDebugEvent("host:resumed", mapOf("activityRecognitionGranted" to isActivityRecognitionGranted(), "sdkStatus" to sdkStatus()))
         refreshPermissionState(notifyJavascript = true, enqueueNativeSync = true, forceSourceEvidence = true)
@@ -596,11 +593,10 @@ class ChallengeAppBridge(
 
     fun dispose() {
         liveStepTracker.dispose()
-        foregroundSyncEngine.onAppBackground()
+        foregroundSyncEngine.dispose()
         bridgeScope.cancel()
     }
 
-    @JavascriptInterface
     fun getLiveActivitySnapshot(): String {
         return try {
             liveStepTracker.snapshot(isActivityRecognitionGranted()).toString()
@@ -614,7 +610,6 @@ class ChallengeAppBridge(
         }
     }
 
-    @JavascriptInterface
     fun openHealthConnectSettings(): String {
         val candidates = listOf(
             Intent("androidx.health.ACTION_HEALTH_CONNECT_SETTINGS"),
@@ -631,7 +626,6 @@ class ChallengeAppBridge(
         return JSONObject().put("opened", false).toString()
     }
 
-    @JavascriptInterface
     fun openKnownHealthApp(packageName: String): String {
         val allowedPackages = knownHealthAppPackages().map { it.first }.toSet()
         if (!allowedPackages.contains(packageName)) {
@@ -704,7 +698,7 @@ class ChallengeAppBridge(
                 val healthGranted = permissionState?.optBoolean("health_connect_granted", false) == true
                 val coreReady = activityPrerequisitesPayload(triggerEvidenceRefresh = false).optBoolean("ready", false) &&
                     physicalGranted && healthGranted
-                if (coreReady) foregroundSyncEngine.onAppForeground("app_resume") else foregroundSyncEngine.onAppBackground()
+                if (coreReady && hasNativeSession()) foregroundSyncEngine.onAppForeground("app_resume") else foregroundSyncEngine.onAppBackground()
             }
             if (notifyJavascript) onNotifyJavascript(checkedPayload)
             if (notifyJavascript) {
@@ -1027,5 +1021,35 @@ class ChallengeAppBridge(
 
     companion object {
         private const val LOG_TAG = "GrafitActivitySync"
+    }
+    override fun invoke(method: String, args: JSONArray): String = when (method) {
+            "getHealthSyncLog" -> getHealthSyncLog()
+            "clearHealthSyncLog" -> clearHealthSyncLog()
+            "shareHealthSyncLog" -> shareHealthSyncLog()
+            "getBridgeInfo" -> getBridgeInfo()
+            "getActivityPrerequisites" -> getActivityPrerequisites()
+            "getBackgroundActivityReadiness" -> getBackgroundActivityReadiness()
+            "openBackgroundActivitySettings" -> openBackgroundActivitySettings()
+            "getBatteryOptimizationState" -> getBatteryOptimizationState()
+            "openBatterySettingsFor" -> openBatterySettingsFor(args.optString(0))
+            "performActivityPrerequisiteAction" -> performActivityPrerequisiteAction(args.optString(0))
+            "authenticate" -> authenticate(args.optString(0), args.optString(1))
+            "clearAuthSession" -> clearAuthSession()
+            "refreshAccessToken" -> refreshAccessToken()
+            "configureNativeHealthSync" -> configureNativeHealthSync(args.optString(0))
+            "clearNativePushRegistration" -> clearNativePushRegistration()
+            "resetLiveAnchorFromServer" -> resetLiveAnchorFromServer(args.optString(0), args.optString(1), args.optString(2))
+            "triggerNativeHealthSync" -> triggerNativeHealthSync()
+            "requestForegroundSync" -> requestForegroundSync(args.optString(0))
+            "getPermissionState" -> getPermissionState()
+            "requestActivityPermissions" -> requestActivityPermissions()
+            "requestPhysicalActivityPermission" -> requestPhysicalActivityPermission()
+            "requestHealthSourcePermissions" -> requestHealthSourcePermissions()
+            "requestBackgroundReadPermission" -> requestBackgroundReadPermission()
+            "requestNotificationPermission" -> requestNotificationPermission()
+            "getLiveActivitySnapshot" -> getLiveActivitySnapshot()
+            "openHealthConnectSettings" -> openHealthConnectSettings()
+            "openKnownHealthApp" -> openKnownHealthApp(args.optString(0))
+            else -> throw IllegalArgumentException("Unknown bridge method")
     }
 }

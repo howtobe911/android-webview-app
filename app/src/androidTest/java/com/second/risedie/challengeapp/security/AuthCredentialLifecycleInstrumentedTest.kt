@@ -10,6 +10,16 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class AuthCredentialLifecycleInstrumentedTest {
+    @Test fun invalidationBlocksEvenANewReaderBeforeCredentialDeletion() {
+        NativeAuthSession.invalidateSession()
+        assertFalse(NativeAuthSession.isSessionActive())
+        val generation = NativeAuthSession.sessionGeneration()
+        try {
+            NativeAuthSession.inSession(generation) { fail("An invalidated session must not expose credentials") }
+            fail("Expected inactive session rejection")
+        } catch (_: IllegalStateException) { /* The delayed logout cleanup cannot be bypassed. */ }
+    }
+
     @Test fun credentialsAndPendingSendSurviveRecreationAndAreClearedOnLogout() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val store = SecureCredentialStore(context)

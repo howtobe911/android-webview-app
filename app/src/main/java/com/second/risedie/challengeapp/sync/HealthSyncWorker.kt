@@ -15,7 +15,10 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.second.risedie.challengeapp.ui.ChallengeWebViewActivity
+import com.second.risedie.challengeapp.security.NativeAuthSession
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import org.json.JSONObject
 import java.io.IOException
 import java.time.Instant
@@ -29,6 +32,7 @@ class HealthSyncWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
+        val generation = NativeAuthSession.sessionGeneration()
         val sessionId = UUID.randomUUID().toString()
         val started = System.nanoTime()
         val logger = HealthSyncLogger(applicationContext)
@@ -49,6 +53,10 @@ class HealthSyncWorker(
 
         return try {
             val syncResult = coordinator.sync("work_manager", sessionId)
+            coroutineContext.ensureActive()
+            if (generation != NativeAuthSession.sessionGeneration() || HealthSyncConfigStore(applicationContext).load() == null) {
+                return Result.success() // A logged-out worker must not rebuild its scheduling chain.
+            }
             val resultType = syncResult.optString("type", "unknown")
             val workResult = when (resultType) {
                 "success", "no_data", "no_permissions", "not_configured", "unavailable" -> "success"
@@ -135,6 +143,11 @@ class HealthSyncWorker(
         private const val INPUT_SCHEDULE_KIND = "schedule_kind"
         private const val SCHEDULE_KIND_NEXT = "next"
 
+        fun cancelAll(context: Context) {
+            val manager = WorkManager.getInstance(context.applicationContext)
+            listOf(PERIODIC_WORK, IMMEDIATE_WORK, NEXT_WORK).forEach { manager.cancelUniqueWork(it) }
+        }
+
         fun configure(context: Context, token: String, apiBase: String, sourceId: Long) {
             HealthSyncCoordinator(context.applicationContext).configure(token, apiBase, sourceId)
         }
@@ -215,6 +228,7 @@ class HealthSyncWorker(
 
         private fun enqueueNext(context: Context, policy: ExistingWorkPolicy) {
             val appContext = context.applicationContext
+            if (HealthSyncConfigStore(appContext).load() == null) return
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()

@@ -1,11 +1,15 @@
 package com.second.risedie.challengeapp.sync
 
 import android.content.Context
+import com.second.risedie.challengeapp.security.NativeAuthSession
 import com.second.risedie.challengeapp.health.LiveStepTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -74,6 +78,17 @@ class ForegroundHealthSyncEngine(
         logger.info("lifecycle", COMPONENT, "app_background")
     }
 
+    fun cancelSession() {
+        onAppBackground()
+        scope.coroutineContext.cancelChildren()
+        appStartRequested.set(false)
+    }
+
+    fun dispose() {
+        onAppBackground()
+        scope.cancel()
+    }
+
     fun startForegroundLoop() {
         if (loopJob?.isActive == true) return
         foreground = true
@@ -103,6 +118,7 @@ class ForegroundHealthSyncEngine(
         reason: String,
         requestId: String = UUID.randomUUID().toString(),
     ): JSONObject = mutex.withLock {
+        val sessionGeneration = NativeAuthSession.sessionGeneration()
         emit(JSONObject()
             .put("type", "started")
             .put("request_id", requestId)
@@ -121,6 +137,8 @@ class ForegroundHealthSyncEngine(
                 .put("reason", reason)
                 .put("message", "Foreground sync timeout")
                 .put("synced_at", Instant.now().toString())
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: Throwable) {
             logger.error(requestId, COMPONENT, "sync_failed", error, JSONObject().put("reason", reason))
             JSONObject()
@@ -132,6 +150,7 @@ class ForegroundHealthSyncEngine(
                 .put("message", error.message ?: error.javaClass.simpleName)
                 .put("synced_at", Instant.now().toString())
         }
+        if (sessionGeneration != NativeAuthSession.sessionGeneration()) return@withLock JSONObject().put("type", "session_changed").put("fresh", false)
         if (result.optBoolean("fresh", false)) {
             setLastSuccessfulSyncAt(Instant.now())
             logger.info(requestId, COMPONENT, "last_success_persisted")

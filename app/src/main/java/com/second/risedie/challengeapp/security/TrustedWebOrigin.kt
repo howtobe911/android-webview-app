@@ -12,13 +12,13 @@ object TrustedWebOrigin {
         allowedHostsJson: String = BuildConfig.APP_ALLOWED_HOSTS_JSON,
     ): String? {
         val value = rawUrl?.trim().orEmpty()
-        if (value.isBlank()) return null
+        if (value.isBlank() || value != rawUrl) return null
 
         val uri = runCatching { URI(value) }.getOrNull() ?: return null
         if (!uri.scheme.equals("https", ignoreCase = true)) return null
         if (uri.rawUserInfo != null) return null
 
-        val host = uri.host?.lowercase(Locale.ROOT)?.trimEnd('.') ?: return null
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return null
         if (host.isBlank() || host !in allowedHosts(allowedHostsJson)) return null
 
         val port = uri.port

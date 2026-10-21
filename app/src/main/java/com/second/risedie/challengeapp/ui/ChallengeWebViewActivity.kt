@@ -29,6 +29,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.R
+import com.second.risedie.challengeapp.bridge.SecureBridgeTransport
 import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import com.second.risedie.challengeapp.security.NativeAuthSession
@@ -46,11 +47,13 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
+    private lateinit var bridgeTransport: SecureBridgeTransport
     private var trustedDocumentReady = false
     private var webSessionRestored = false
     private var internalNavigationSequence = 0
     private var pendingInternalRoute: String? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private var fileChooserGeneration = -1L
 
     private val healthPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -66,7 +69,8 @@ class ChallengeWebViewActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val callback = fileChooserCallback ?: return@registerForActivityResult
             fileChooserCallback = null
-            callback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data))
+            val current = fileChooserGeneration == NativeAuthSession.sessionGeneration() && trustedDocumentReady && bridge.hasNativeSession()
+            callback.onReceiveValue(if (current) WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data) else null)
         }
 
     private val activityRecognitionPermissionLauncher =
@@ -100,12 +104,14 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
         bridge = ChallengeAppBridge(
             activity = this,
-            onLaunchPermissions = { intent -> healthPermissionLauncher.launch(intent) },
+            onLaunchPermissions = { intent -> runTrustedUiAction { healthPermissionLauncher.launch(intent) } },
             onLaunchActivityRecognitionPermission = {
+                runTrustedUiAction {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                     bridge.onActivityRecognitionPermissionResult(true)
                 } else {
                     activityRecognitionPermissionLauncher.launch(Manifest.permission.ACTIVITY_RECOGNITION)
+                }
                 }
             },
             isActivityRecognitionGranted = { isActivityRecognitionGranted() },
@@ -115,12 +121,17 @@ class ChallengeWebViewActivity : ComponentActivity() {
             onPrerequisitesJavascript = { eventJson -> dispatchPrerequisitesEvent(eventJson) },
             onBackgroundReadinessJavascript = { eventJson -> dispatchBackgroundReadinessEvent(eventJson) },
             onLaunchNotificationPermission = {
+                runTrustedUiAction {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
             },
         )
 
         configureWebView(webView)
-        webView.addJavascriptInterface(bridge, "ChallengeAppBridge")
+        bridgeTransport = SecureBridgeTransport(webView, bridge)
+        if (!bridgeTransport.install()) {
+            android.widget.Toast.makeText(this, "Обновите Android System WebView для безопасной работы GraFit.", android.widget.Toast.LENGTH_LONG).show()
+        }
 
         Thread {
             runCatching { NativeAuthSession(applicationContext).restoreWebSession() }
@@ -138,7 +149,8 @@ class ChallengeWebViewActivity : ComponentActivity() {
                     if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:loadUrl url=$resolvedLaunchUrl")
                     webView.loadUrl(resolvedLaunchUrl)
                 } else {
-                    webView.restoreState(savedInstanceState)
+                    val restored = webView.restoreState(savedInstanceState)
+                    if (restored == null || !TrustedWebOrigin.isTrustedUrl(webView.url)) webView.loadUrl(BuildConfig.APP_WEB_URL)
                     pendingInternalRoute?.let { navigateInternalOrLoad(it) }
                 }
                 pendingInternalRoute = null
@@ -146,10 +158,10 @@ class ChallengeWebViewActivity : ComponentActivity() {
         }.start()
 
         onBackPressedDispatcher.addCallback(this) {
-            if (webView.canGoBack()) {
-                webView.goBack()
-            } else {
-                finish()
+            webView.evaluateJavascript("Boolean(window.GrafitModal && window.GrafitModal.closeTop())") { closed ->
+                if (closed != "true") {
+                    if (webView.canGoBack()) webView.goBack() else finish()
+                }
             }
         }
     }
@@ -208,6 +220,18 @@ class ChallengeWebViewActivity : ComponentActivity() {
         } catch (_: Exception) { fallback() }
     }
 
+    private fun runTrustedUiAction(action: () -> Unit) {
+        val generation = NativeAuthSession.sessionGeneration()
+        runOnUiThread {
+            if (generation == NativeAuthSession.sessionGeneration() && trustedDocumentReady &&
+                TrustedWebOrigin.isTrustedUrl(webView.url) && bridge.hasNativeSession() && !isFinishing && !isDestroyed) {
+                action()
+            } else {
+                bridge.onPermissionLaunchAborted()
+            }
+        }
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(android.app.NotificationManager::class.java)
@@ -217,12 +241,13 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private fun resolvePushLaunchUrl(defaultUrl: String, intent: Intent?): String {
         val route = sanitizePushRoute(intent?.getStringExtra(EXTRA_PUSH_ROUTE) ?: intent?.getStringExtra("route")) ?: return defaultUrl
-        return Uri.parse(defaultUrl).buildUpon().encodedPath(route).build().toString()
+        val target = Uri.parse(route)
+        return Uri.parse(defaultUrl).buildUpon().encodedPath(target.encodedPath).encodedQuery(target.encodedQuery).encodedFragment(target.encodedFragment).build().toString()
     }
 
     private fun sanitizePushRoute(route: String?): String? {
         val value = route?.trim().orEmpty()
-        return value.takeIf { it.startsWith("/web/") && !it.startsWith("//") && !it.contains("://") }
+        return value.takeIf { it.startsWith("/web/") && !it.startsWith("//") && !it.contains("://") && !it.contains("\\") && it.none { ch -> ch.code < 32 } }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -245,7 +270,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
             allowContentAccess = false
             setSupportMultipleWindows(false)
             javaScriptCanOpenWindowsAutomatically = false
-            userAgentString = userAgentString + " ChallengeAppWebView/3.0"
+            userAgentString = userAgentString + " ChallengeAppWebView/3.0 GraFitDistribution/" + BuildConfig.BILLING_CHANNEL
         }
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
@@ -256,8 +281,13 @@ class ChallengeWebViewActivity : ComponentActivity() {
                 filePathCallback: ValueCallback<Array<Uri>>?,
                 fileChooserParams: FileChooserParams?,
             ): Boolean {
+                if (!trustedDocumentReady || !TrustedWebOrigin.isTrustedUrl(webView?.url) || !bridge.hasNativeSession()) {
+                    filePathCallback?.onReceiveValue(null)
+                    return true
+                }
                 fileChooserCallback?.onReceiveValue(null)
                 fileChooserCallback = filePathCallback
+                fileChooserGeneration = NativeAuthSession.sessionGeneration()
 
                 val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                     addCategory(Intent.CATEGORY_OPENABLE)
@@ -285,20 +315,26 @@ class ChallengeWebViewActivity : ComponentActivity() {
         }
         target.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url ?: return false
-                return !isAllowedInternalUrl(url).also { allowed ->
-                    if (!allowed) openExternal(url)
-                }
+                val url = request?.url ?: return true
+                if (!request.isForMainFrame) return true
+                if (isAllowedInternalUrl(url)) return false
+                if (request.hasGesture()) openExternal(url)
+                return true
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 trustedDocumentReady = false
+                bridgeTransport.invalidateDocument()
+                fileChooserCallback?.onReceiveValue(null)
+                fileChooserCallback = null
+                if (!TrustedWebOrigin.isTrustedUrl(url)) view?.stopLoading()
                 super.onPageStarted(view, url, favicon)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                trustedDocumentReady = url != null && isAllowedInternalUrl(Uri.parse(url))
+                trustedDocumentReady = url != null && url == view?.url && isAllowedInternalUrl(Uri.parse(url))
+                if (trustedDocumentReady) bridgeTransport.attachDocument(url)
                 if (BuildConfig.DEBUG) Log.d(LOG_TAG, "webview:onPageFinished url=$url")
                 notifyBridgeReady()
             }
@@ -311,6 +347,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
                     trustedDocumentReady = false
+                    bridgeTransport.invalidateDocument()
                     dispatchJavascriptEvent(
                         JSONObject()
                             .put("available", true)
@@ -335,7 +372,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         """.trimIndent()
 
         webView.post {
-            if (!isFinishing && !isDestroyed) {
+            if (trustedDocumentReady && TrustedWebOrigin.isTrustedUrl(webView.url) && bridge.hasNativeSession() && !isFinishing && !isDestroyed) {
                 webView.evaluateJavascript(script, null)
             }
         }
@@ -346,6 +383,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
 
     private fun dispatchActivitySyncEvent(eventJson: String) {
+        val sessionGeneration = NativeAuthSession.sessionGeneration()
         if (BuildConfig.DEBUG) Log.d(LOG_TAG, "dispatchActivitySyncEvent payload=$eventJson")
         val quoted = JSONObject.quote(eventJson)
         val script = """
@@ -356,7 +394,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         """.trimIndent()
 
         webView.post {
-            if (!isFinishing && !isDestroyed) {
+            if (sessionGeneration == NativeAuthSession.sessionGeneration() && trustedDocumentReady && TrustedWebOrigin.isTrustedUrl(webView.url) && bridge.hasNativeSession() && !isFinishing && !isDestroyed) {
                 webView.evaluateJavascript(script, null)
             }
         }
@@ -364,6 +402,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private fun dispatchPrerequisitesEvent(eventJson: String) {
         runOnUiThread {
+            if (!trustedDocumentReady || !TrustedWebOrigin.isTrustedUrl(webView.url) || !bridge.hasNativeSession() || isDestroyed) return@runOnUiThread
             val quoted = JSONObject.quote(eventJson)
             webView.evaluateJavascript(
                 """
@@ -381,6 +420,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
 
     private fun dispatchBackgroundReadinessEvent(eventJson: String) {
         runOnUiThread {
+            if (!trustedDocumentReady || !TrustedWebOrigin.isTrustedUrl(webView.url) || !bridge.hasNativeSession() || isDestroyed) return@runOnUiThread
             val quoted = JSONObject.quote(eventJson)
             webView.evaluateJavascript(
                 """
@@ -407,7 +447,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         """.trimIndent()
 
         webView.post {
-            if (!isFinishing && !isDestroyed) {
+            if (trustedDocumentReady && TrustedWebOrigin.isTrustedUrl(webView.url) && bridge.hasNativeSession() && !isFinishing && !isDestroyed) {
                 webView.evaluateJavascript(script, null)
             }
         }
@@ -416,7 +456,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     private fun notifyBridgeReady() {
         val script = "window.dispatchEvent(new CustomEvent('grafit-native-bridge-ready'));true;"
         webView.post {
-            if (!isFinishing && !isDestroyed) {
+            if (trustedDocumentReady && TrustedWebOrigin.isTrustedUrl(webView.url) && bridge.hasNativeSession() && !isFinishing && !isDestroyed) {
                 webView.evaluateJavascript(script, null)
             }
         }
@@ -436,6 +476,8 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     private fun openExternal(uri: Uri) {
+        if (uri.scheme?.lowercase() !in setOf("https", "http", "mailto", "tel")) return
+        if (uri.userInfo != null) return
         val intent = Intent(Intent.ACTION_VIEW, uri)
         try {
             startActivity(intent)
@@ -451,7 +493,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     override fun onDestroy() {
         fileChooserCallback?.onReceiveValue(null)
         fileChooserCallback = null
-        webView.removeJavascriptInterface("ChallengeAppBridge")
+        bridgeTransport.dispose()
         webView.stopLoading()
         webView.webChromeClient = WebChromeClient()
         webView.webViewClient = WebViewClient()

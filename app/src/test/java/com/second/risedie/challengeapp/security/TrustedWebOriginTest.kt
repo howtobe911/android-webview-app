@@ -19,6 +19,10 @@ class TrustedWebOriginTest {
         assertNull(TrustedWebOrigin.canonicalOrigin("https://second.risedie.ru.evil.example", hosts))
         assertNull(TrustedWebOrigin.canonicalOrigin("https://second.risedie.ru@evil.example", hosts))
         assertNull(TrustedWebOrigin.canonicalOrigin("https://second.risedie.ru:8443", hosts))
+        assertNull(TrustedWebOrigin.canonicalOrigin("https://@second.risedie.ru/", hosts))
+        assertNull(TrustedWebOrigin.canonicalOrigin("https://second.risedie.ru./", hosts))
+        assertNull(TrustedWebOrigin.canonicalOrigin(" https://second.risedie.ru/", hosts))
+        assertNull(TrustedWebOrigin.canonicalOrigin("file:///tmp/page.html", hosts))
         assertEquals("https://second.risedie.ru", TrustedWebOrigin.canonicalOrigin("https://second.risedie.ru:443/a", hosts))
     }
 

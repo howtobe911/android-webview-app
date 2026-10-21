@@ -50,6 +50,9 @@ android {
             useSupportLibrary = true
         }
 
+        val billingChannel = providers.gradleProperty("GRAFIT_DISTRIBUTION_CHANNEL").orElse("disabled").get()
+        require(billingChannel in setOf("disabled", "direct", "play")) { "Invalid GRAFIT_DISTRIBUTION_CHANNEL" }
+        buildConfigField("String", "BILLING_CHANNEL", "\"$billingChannel\"")
         buildConfigField("String", "APP_WEB_URL", "\"https://second.risedie.ru/web\"")
         buildConfigField(
             "String",
@@ -119,6 +122,8 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
     implementation("com.google.firebase:firebase-messaging")
     testImplementation("junit:junit:4.13.2")
+    // Local JVM origin tests need a JSON implementation, not android.jar's throwing stubs.
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:core-ktx:1.6.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
