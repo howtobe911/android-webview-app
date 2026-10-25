@@ -63,9 +63,10 @@ class HealthSyncApiClient(
     private fun parseServerInstant(value: String): Instant =
         OffsetDateTime.parse(value).toInstant()
 
-    fun fetchDetailRequests(config: HealthSyncConfig, serverDay: String, sessionId: String): JSONArray {
+    fun fetchDetailRequests(config: HealthSyncConfig, sessionId: String): JSONArray {
+        // Pending requests may target previous UTC days. Never filter to today.
         val response = getJson(
-            "${config.apiBase}/api/v1/me/activity/detail-requests?activity_date=$serverDay",
+            "${config.apiBase}/api/v1/me/activity/detail-requests?limit=100",
             config.token,
             sessionId,
             "detail_requests",

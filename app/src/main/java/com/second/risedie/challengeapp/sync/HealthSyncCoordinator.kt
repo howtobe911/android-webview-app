@@ -83,7 +83,7 @@ class HealthSyncCoordinator(context: Context) {
 
             val batches = payload.optJSONArray("batches") ?: JSONArray()
             if (batches.length() == 0) {
-                return@withContext noData(reason, sessionId, syncWindow, payload.optString("message", "Health Connect returned no records"))
+                logger.info(sessionId, "health_reader", "no_current_batches_detail_requests_still_checked")
             }
 
             var accepted = 0
@@ -129,6 +129,12 @@ class HealthSyncCoordinator(context: Context) {
                 posted += detailResult.optInt("posted", 0)
                 detailResult.optJSONObject("current_state")?.takeIf { it.length() > 0 }?.let { currentState = it }
                 detailResult.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 }?.let { totals = it }
+            }
+
+            // Preserve the original no-data contract if neither the current-day
+            // read nor the historical detail recovery had anything to upload.
+            if (batches.length() == 0 && posted == 0) {
+                return@withContext noData(reason, sessionId, syncWindow, payload.optString("message", "Health Connect returned no records"))
             }
 
             val type = if (accepted > 0 || duplicate > 0 || currentState != null || posted > 0) "success" else "no_data"
@@ -239,7 +245,7 @@ class HealthSyncCoordinator(context: Context) {
         sessionId: String,
     ): JSONObject {
         val result = JSONObject().put("accepted", 0).put("rejected", 0).put("posted", 0)
-        val requests = apiClient.fetchDetailRequests(config, syncWindow.serverDay, sessionId)
+        val requests = apiClient.fetchDetailRequests(config, sessionId)
         logger.info(sessionId, "detail_requests", "fetched", JSONObject().put("requests_count", requests.length()))
         if (requests.length() == 0) return result
 
@@ -250,30 +256,43 @@ class HealthSyncCoordinator(context: Context) {
             return result
         }
 
-        val body = JSONObject()
-            .put("source_id", config.sourceId)
-            .put("kind", "activity_detail_windows")
-            .put("external_batch_id", payload.optString("external_batch_id"))
-            .put("generated_at", payload.optString("generated_at"))
-            .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
-            .put("server_day", syncWindow.serverDay)
-            .put("activity_date", syncWindow.serverDay)
-            .put("timezone", "UTC")
-            .put("server_timezone", "UTC")
-            .put("window_from_utc", syncWindow.windowFromUtc.toString())
-            .put("window_to_utc", syncWindow.windowToUtc.toString())
-            .put("records", records)
-            .put("is_live_ui_only", false)
-            .put("source_of_truth", "health_connect")
-
-        val response = apiClient.postSourceSync(config, body, syncWindow.serverDay, sessionId)
-        val data = response.optJSONObject("data") ?: JSONObject()
+        // The backend resolves the historical activity date from each record's
+        // signed timestamps. The outer server_day stays CURRENT for nonce security.
+        // Chunking respects SyncActivityRequest's maximum 2000 records per batch.
+        var accepted = 0
+        var rejected = 0
+        var posted = 0
+        var lastData = JSONObject()
+        for (offset in 0 until records.length() step 2000) {
+            val chunk = JSONArray()
+            for (i in offset until minOf(offset + 2000, records.length())) chunk.put(records.getJSONObject(i))
+            val body = JSONObject()
+                .put("source_id", config.sourceId)
+                .put("kind", "activity_detail_windows")
+                .put("external_batch_id", payload.optString("external_batch_id") + "-" + (offset / 2000))
+                .put("generated_at", payload.optString("generated_at"))
+                .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
+                .put("server_day", syncWindow.serverDay)
+                .put("activity_date", syncWindow.serverDay)
+                .put("timezone", "UTC")
+                .put("server_timezone", "UTC")
+                .put("window_from_utc", syncWindow.windowFromUtc.toString())
+                .put("window_to_utc", syncWindow.windowToUtc.toString())
+                .put("records", chunk)
+                .put("is_live_ui_only", false)
+                .put("source_of_truth", "health_connect")
+            val response = apiClient.postSourceSync(config, body, syncWindow.serverDay, sessionId)
+            lastData = response.optJSONObject("data") ?: JSONObject()
+            accepted += lastData.optInt("accepted_records", 0)
+            rejected += lastData.optInt("rejected_records", 0)
+            posted++
+        }
         return result
-            .put("accepted", data.optInt("accepted_records", 0))
-            .put("rejected", data.optInt("rejected_records", 0))
-            .put("posted", 1)
-            .put("authoritative_totals", data.optJSONObject("authoritative_totals") ?: JSONObject())
-            .put("current_state", data.optJSONObject("current_state") ?: JSONObject())
+            .put("accepted", accepted)
+            .put("rejected", rejected)
+            .put("posted", posted)
+            .put("authoritative_totals", lastData.optJSONObject("authoritative_totals") ?: JSONObject())
+            .put("current_state", lastData.optJSONObject("current_state") ?: JSONObject())
     }
 
     private fun buildSourceSyncBody(
