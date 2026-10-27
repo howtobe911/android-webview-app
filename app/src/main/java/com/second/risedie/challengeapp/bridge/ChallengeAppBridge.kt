@@ -299,6 +299,9 @@ class ChallengeAppBridge(
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
+        // A one-time constrained job survives a power cycle or app going to background;
+        // it will fetch still-open historical detail requests when connectivity returns.
+        HealthSyncWorker.enqueueImmediate(context)
         foregroundSyncEngine.startForegroundLoop()
 
         runCatching { PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase) }

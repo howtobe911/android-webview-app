@@ -59,6 +59,13 @@ class HealthSyncCoordinator(context: Context) {
             require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
 
             apiClient.retryPendingSourceSync(config, sessionId)
+            // Old verification windows can expire sooner than the current-day snapshot.
+            // Give outstanding detail requests first priority on every reconnection.
+            val detailResult = runCatching {
+                postPendingDetailRequests(config, syncWindow, sessionId)
+            }.onFailure { error ->
+                logger.warn(sessionId, "detail_requests", "sync_failed_non_blocking", error = error)
+            }.getOrNull()
             postPreviousDayCloseSnapshotIfNeeded(config, syncWindow, sessionId)
 
             logger.info(sessionId, "health_reader", "read_started", JSONObject()
@@ -86,12 +93,12 @@ class HealthSyncCoordinator(context: Context) {
                 logger.info(sessionId, "health_reader", "no_current_batches_detail_requests_still_checked")
             }
 
-            var accepted = 0
+            var accepted = detailResult?.optInt("accepted", 0) ?: 0
             var duplicate = 0
-            var rejected = 0
-            var posted = 0
-            var currentState: JSONObject? = null
-            var totals: JSONObject? = null
+            var rejected = detailResult?.optInt("rejected", 0) ?: 0
+            var posted = detailResult?.optInt("posted", 0) ?: 0
+            var currentState: JSONObject? = detailResult?.optJSONObject("current_state")?.takeIf { it.length() > 0 }
+            var totals: JSONObject? = detailResult?.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 }
 
             for (index in 0 until batches.length()) {
                 val batch = batches.optJSONObject(index) ?: continue
@@ -116,19 +123,6 @@ class HealthSyncCoordinator(context: Context) {
                 currentState = data.optJSONObject("current_state") ?: currentState
                 totals = data.optJSONObject("authoritative_totals") ?: totals
                 posted += 1
-            }
-
-            val detailResult = runCatching {
-                postPendingDetailRequests(config, syncWindow, sessionId)
-            }.onFailure { error ->
-                logger.warn(sessionId, "detail_requests", "sync_failed_non_blocking", error = error)
-            }.getOrNull()
-            if (detailResult != null) {
-                accepted += detailResult.optInt("accepted", 0)
-                rejected += detailResult.optInt("rejected", 0)
-                posted += detailResult.optInt("posted", 0)
-                detailResult.optJSONObject("current_state")?.takeIf { it.length() > 0 }?.let { currentState = it }
-                detailResult.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 }?.let { totals = it }
             }
 
             // Preserve the original no-data contract if neither the current-day

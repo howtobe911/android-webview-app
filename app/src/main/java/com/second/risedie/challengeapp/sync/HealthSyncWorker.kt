@@ -152,18 +152,26 @@ class HealthSyncWorker(
             HealthSyncCoordinator(context.applicationContext).configure(token, apiBase, sourceId)
         }
 
+        /** One durable recovery job, held by WorkManager until connectivity returns.
+         * KEEP prevents app-resume/boot/network events from cancelling an in-flight sync.
+         */
         fun enqueueImmediate(context: Context) {
-            val logger = HealthSyncLogger(context.applicationContext)
+            val appContext = context.applicationContext
+            if (HealthSyncConfigStore(appContext).load() == null) return
+            val logger = HealthSyncLogger(appContext)
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
             val request = OneTimeWorkRequestBuilder<HealthSyncWorker>()
+                .setInputData(Data.Builder().putString(INPUT_SCHEDULE_KIND, "reconnect").build())
                 .setConstraints(constraints)
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
-            WorkManager.getInstance(context.applicationContext)
-                .enqueueUniqueWork(IMMEDIATE_WORK, ExistingWorkPolicy.REPLACE, request)
-            logger.info("scheduler", COMPONENT, "immediate_work_enqueued")
+            WorkManager.getInstance(appContext)
+                .enqueueUniqueWork(IMMEDIATE_WORK, ExistingWorkPolicy.KEEP, request)
+            logger.info("scheduler", COMPONENT, "reconnect_work_enqueued", JSONObject()
+                .put("unique_name", IMMEDIATE_WORK)
+                .put("policy", "KEEP"))
         }
 
         fun enqueuePeriodic(context: Context) {

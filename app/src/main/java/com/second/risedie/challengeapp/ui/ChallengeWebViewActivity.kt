@@ -34,6 +34,8 @@ import com.second.risedie.challengeapp.bridge.ChallengeAppBridge
 import com.second.risedie.challengeapp.security.TrustedWebOrigin
 import com.second.risedie.challengeapp.security.NativeAuthSession
 import com.second.risedie.challengeapp.push.GraFitFirebaseMessagingService
+import com.second.risedie.challengeapp.sync.HealthNetworkRecoveryMonitor
+import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import org.json.JSONObject
 
 class ChallengeWebViewActivity : ComponentActivity() {
@@ -48,6 +50,25 @@ class ChallengeWebViewActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private lateinit var bridge: ChallengeAppBridge
     private lateinit var bridgeTransport: SecureBridgeTransport
+    private val networkRecoveryMonitor by lazy {
+        HealthNetworkRecoveryMonitor(applicationContext,
+            onRestored = {
+                runOnUiThread {
+                    if (isInForeground && bridge.hasNativeSession()) {
+                        // Coordinator polls pending historical detail requests in this same sync.
+                        bridge.requestForegroundSync("network_restored")
+                    } else {
+                        // App is backgrounded: run via constrained, durable WorkManager.
+                        HealthSyncWorker.enqueueImmediate(applicationContext)
+                    }
+                }
+            },
+            onDisconnected = {
+                // The one-off worker survives leaving the app and waits for a connection.
+                HealthSyncWorker.enqueueImmediate(applicationContext)
+            },
+        )
+    }
     private var trustedDocumentReady = false
     private var webSessionRestored = false
     private var internalNavigationSequence = 0
@@ -171,6 +192,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
         isInForeground = true
         createNotificationChannel()
         bridge.onHostResumed()
+        networkRecoveryMonitor.start()
     }
 
     override fun onStop() {
@@ -491,6 +513,7 @@ class ChallengeWebViewActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        networkRecoveryMonitor.stop()
         fileChooserCallback?.onReceiveValue(null)
         fileChooserCallback = null
         bridgeTransport.dispose()
