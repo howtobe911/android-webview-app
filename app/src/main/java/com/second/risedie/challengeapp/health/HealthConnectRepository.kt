@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import com.second.risedie.challengeapp.sync.HealthSyncLogger
+import com.second.risedie.challengeapp.sync.HealthConnectQuotaGuard
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -813,6 +814,7 @@ class HealthConnectRepository(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
             warnings.add("steps_aggregate: ${error.message ?: error.javaClass.simpleName}")
             null
         }
@@ -854,6 +856,7 @@ class HealthConnectRepository(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
             warnings.add("steps_records: ${error.message ?: error.javaClass.simpleName}")
             StepsReadResult(
                 total = 0L,
@@ -900,6 +903,7 @@ class HealthConnectRepository(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
             warnings.add("running_sessions: ${error.message ?: error.javaClass.simpleName}")
             return RunningActivityData(
                 originalSessions = emptyList(),
@@ -946,6 +950,7 @@ class HealthConnectRepository(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
             warnings.add("distance_records: ${error.message ?: error.javaClass.simpleName}")
             return RunningActivityData(
                 originalSessions = originalSessions,

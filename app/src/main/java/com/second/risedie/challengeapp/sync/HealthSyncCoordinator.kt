@@ -23,6 +23,7 @@ class HealthSyncCoordinator(context: Context) {
     private val logger = HealthSyncLogger(appContext)
     private val repository = HealthConnectRepository(appContext, logger)
     private val apiClient = HealthSyncApiClient(appContext, logger)
+    private val quotaGuard = HealthConnectQuotaGuard(appContext)
 
     fun configure(token: String, apiBase: String, sourceId: Long) {
         configStore.save(token, apiBase, sourceId)
@@ -42,6 +43,20 @@ class HealthSyncCoordinator(context: Context) {
         logger.info(sessionId, COMPONENT, "configuration_loaded", JSONObject()
             .put("api_host", runCatching { java.net.URL(config.apiBase).host }.getOrDefault("invalid"))
             .put("source_id", config.sourceId))
+
+        val quotaDelay = quotaGuard.remainingMillis()
+        if (quotaDelay > 0L) {
+            logger.info(sessionId, "health_reader", "quota_cooldown_active", JSONObject()
+                .put("retry_after_ms", quotaDelay))
+            return@withContext JSONObject()
+                .put("type", "quota_cooldown")
+                .put("success", false)
+                .put("fresh", false)
+                .put("reason", reason)
+                .put("request_id", sessionId)
+                .put("retry_after_ms", quotaDelay)
+                .put("synced_at", Instant.now().toString())
+        }
 
         val sdkStatus = repository.sdkStatus()
         logger.info(sessionId, "health_reader", "sdk_status", JSONObject().put("status", sdkStatus))
@@ -84,6 +99,8 @@ class HealthSyncCoordinator(context: Context) {
             }
             var detailError = detailAttempt.exceptionOrNull()
             detailError?.let { if (it is CancellationException) throw it }
+            // A provider-wide quota error must stop *all* reads for this run.
+            detailError?.let { if (HealthConnectQuotaGuard.isQuotaExceeded(it)) throw it }
             detailError?.let { error ->
                 // Do not silently classify a failed evidence read/upload as success.
                 // The request remains requested server-side and will be retried on
@@ -109,6 +126,7 @@ class HealthSyncCoordinator(context: Context) {
                 delayMillis = READ_DELAY_MS,
                 traceSessionId = sessionId,
             )
+            quotaGuard.recordSuccessfulRead()
             payload.put("preferred_source", "health_connect")
             val payloadSummary = logPayloadSummary(sessionId, payload, readStarted)
             logger.info(sessionId, "health_reader", "health_connect_snapshot", JSONObject(payloadSummary.toString())
@@ -246,6 +264,21 @@ class HealthSyncCoordinator(context: Context) {
             logger.warn(sessionId, COMPONENT, "sync_cancelled", JSONObject().put("reason", reason), error)
             throw error
         } catch (error: Throwable) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) {
+                val retryAt = quotaGuard.recordQuotaExceeded()
+                val remaining = (retryAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                logger.warn(sessionId, "health_reader", "quota_cooldown_started", JSONObject()
+                    .put("retry_after_ms", remaining)
+                    .put("reason", reason), error)
+                return@withContext JSONObject()
+                    .put("type", "quota_cooldown")
+                    .put("success", false)
+                    .put("fresh", false)
+                    .put("reason", reason)
+                    .put("request_id", sessionId)
+                    .put("retry_after_ms", remaining)
+                    .put("synced_at", Instant.now().toString())
+            }
             val transient = isTransientFailure(error)
             logger.error(sessionId, COMPONENT, if (transient) "sync_transient_failure" else "sync_failed", error, JSONObject()
                 .put("reason", reason)
@@ -487,7 +520,7 @@ class HealthSyncCoordinator(context: Context) {
     companion object {
         private val processSyncMutex = Mutex()
         private const val COMPONENT = "coordinator"
-        private const val READ_ATTEMPTS = 8
+        private const val READ_ATTEMPTS = 2
         private const val READ_DELAY_MS = 750L
         private val WINDOW_KINDS = setOf("walk_steps_windows", "activity_windows", "activity_detail_windows")
     }
