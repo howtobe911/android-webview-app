@@ -7,6 +7,7 @@ import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -51,7 +52,24 @@ class HealthSyncCoordinator(context: Context) {
         val permissionsGranted = repository.hasPermissions()
         logger.info(sessionId, "health_reader", "permissions_state", JSONObject().put("data_permissions_granted", permissionsGranted))
         if (!permissionsGranted) {
-            return@withContext failure("no_permissions", reason, sessionId, "Health Connect permissions are missing")
+            val granted = runCatching { repository.grantedPermissions() }.getOrDefault(emptySet())
+            // Missing RUN permissions must not strand a WALK investigation.
+            // Do not publish a partial daily aggregate as complete run data.
+            val stepPermission = granted.contains(repository.stepsReadPermission)
+            if (stepPermission) {
+                val forensic = runCatching {
+                    val window = apiClient.fetchSyncWindow(config, sessionId)
+                    postPendingDetailRequests(config, window, sessionId)
+                }
+                forensic.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                forensic.onFailure { logger.warn(sessionId, "detail_requests", "partial_permission_recovery_failed", error = it) }
+                return@withContext failure("no_permissions", reason, sessionId,
+                    "Full Health Connect permissions are required for daily totals; available steps detail was checked")
+                    .put("detail_verification_requests", forensic.getOrNull()?.optInt("pending_requests", 0) ?: 0)
+                    .put("detail_verification_pending_retry", forensic.isFailure)
+                    .put("detail_verification_error", forensic.exceptionOrNull()?.javaClass?.simpleName ?: JSONObject.NULL)
+            }
+            return@withContext failure("no_permissions", reason, sessionId, "Health Connect step permission is missing")
         }
 
         try {
@@ -61,11 +79,20 @@ class HealthSyncCoordinator(context: Context) {
             apiClient.retryPendingSourceSync(config, sessionId)
             // Old verification windows can expire sooner than the current-day snapshot.
             // Give outstanding detail requests first priority on every reconnection.
-            val detailResult = runCatching {
+            val detailAttempt = runCatching {
                 postPendingDetailRequests(config, syncWindow, sessionId)
-            }.onFailure { error ->
-                logger.warn(sessionId, "detail_requests", "sync_failed_non_blocking", error = error)
-            }.getOrNull()
+            }
+            var detailError = detailAttempt.exceptionOrNull()
+            detailError?.let { if (it is CancellationException) throw it }
+            detailError?.let { error ->
+                // Do not silently classify a failed evidence read/upload as success.
+                // The request remains requested server-side and will be retried on
+                // the next sync; ordinary fresh-day telemetry may still proceed.
+                logger.warn(sessionId, "detail_requests", "verification_pending_retry", JSONObject()
+                    .put("error_class", error.javaClass.simpleName)
+                    .put("retryable", isTransientFailure(error)), error)
+            }
+            var detailResult = detailAttempt.getOrNull()
             postPreviousDayCloseSnapshotIfNeeded(config, syncWindow, sessionId)
 
             logger.info(sessionId, "health_reader", "read_started", JSONObject()
@@ -100,6 +127,7 @@ class HealthSyncCoordinator(context: Context) {
             var currentState: JSONObject? = detailResult?.optJSONObject("current_state")?.takeIf { it.length() > 0 }
             var totals: JSONObject? = detailResult?.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 }
 
+            var lastAggregateBatchId = 0L
             for (index in 0 until batches.length()) {
                 val batch = batches.optJSONObject(index) ?: continue
                 val kind = batch.optString("kind")
@@ -123,12 +151,37 @@ class HealthSyncCoordinator(context: Context) {
                 currentState = data.optJSONObject("current_state") ?: currentState
                 totals = data.optJSONObject("authoritative_totals") ?: totals
                 posted += 1
+                if (kind == "health_connect_aggregate") lastAggregateBatchId = data.optLong("batch_id", 0L)
+            }
+
+            // HTTP 202 only means queued. The investigation is created by the
+            // importer AFTER that ACK, so a poll before uploading cannot see it.
+            if (lastAggregateBatchId > 0L && (detailResult?.optInt("pending_requests", 0) ?: 0) == 0) {
+                val followUp = runCatching {
+                    awaitAggregateProcessing(config, lastAggregateBatchId, sessionId)
+                    postPendingDetailRequests(config, syncWindow, sessionId)
+                }
+                val followUpError = followUp.exceptionOrNull()
+                if (followUpError is CancellationException) throw followUpError
+                detailError = followUpError
+                followUp.getOrNull()?.let { recovered ->
+                    detailResult = recovered
+                    accepted += recovered.optInt("accepted", 0)
+                    rejected += recovered.optInt("rejected", 0)
+                    posted += recovered.optInt("posted", 0)
+                    currentState = recovered.optJSONObject("current_state")?.takeIf { it.length() > 0 } ?: currentState
+                    totals = recovered.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 } ?: totals
+                }
             }
 
             // Preserve the original no-data contract if neither the current-day
             // read nor the historical detail recovery had anything to upload.
             if (batches.length() == 0 && posted == 0) {
                 return@withContext noData(reason, sessionId, syncWindow, payload.optString("message", "Health Connect returned no records"))
+                    .put("detail_verification_pending_retry", detailError != null || (detailResult?.optInt("failed_requests", 0) ?: 0) > 0)
+                    .put("detail_verification_retryable", (detailError?.let { isTransientFailure(it) } ?: false) || (detailResult?.optBoolean("retryable", false) ?: false))
+                    .put("detail_verification_requests", detailResult?.optInt("pending_requests", 0) ?: 0)
+                    .put("detail_verification_error", detailError?.javaClass?.simpleName ?: detailResult?.optString("last_error")?.takeIf { it.isNotBlank() } ?: JSONObject.NULL)
             }
 
             val type = if (accepted > 0 || duplicate > 0 || currentState != null || posted > 0) "success" else "no_data"
@@ -151,6 +204,10 @@ class HealthSyncCoordinator(context: Context) {
                 .put("accepted_records", accepted)
                 .put("duplicate_records", duplicate)
                 .put("rejected_records", rejected)
+                .put("detail_verification_pending_retry", detailError != null || (detailResult?.optInt("pending_requests", 0) ?: 0) > 0)
+                .put("detail_verification_error", detailError?.javaClass?.simpleName ?: detailResult?.optString("last_error")?.takeIf { it.isNotBlank() } ?: JSONObject.NULL)
+                .put("detail_verification_retryable", (detailError?.let { isTransientFailure(it) } ?: false) || (detailResult?.optBoolean("retryable", false) ?: false))
+                .put("detail_verification_requests", detailResult?.optInt("pending_requests", 0) ?: 0)
                 .put("steps", payloadSummary.optLong("steps", 0L))
                 .put("run_meters", payloadSummary.optDouble("run_meters", 0.0))
                 .put("records_count", payloadSummary.optInt("records_count", 0))
@@ -242,51 +299,88 @@ class HealthSyncCoordinator(context: Context) {
         val requests = apiClient.fetchDetailRequests(config, sessionId)
         logger.info(sessionId, "detail_requests", "fetched", JSONObject().put("requests_count", requests.length()))
         if (requests.length() == 0) return result
+        result.put("pending_requests", requests.length())
 
-        val payload = repository.buildDetailWindowsPayload(requests, traceSessionId = sessionId)
-        val records = payload.optJSONArray("records") ?: JSONArray()
-        if (records.length() == 0) {
-            logger.info(sessionId, "detail_requests", "skipped_no_records")
-            return result
-        }
-
-        // The backend resolves the historical activity date from each record's
-        // signed timestamps. The outer server_day stays CURRENT for nonce security.
-        // Chunking respects SyncActivityRequest's maximum 2000 records per batch.
+        // Read and upload one request at a time. One provider/read/permission
+        // failure must not discard already-read evidence for every other request.
         var accepted = 0
         var rejected = 0
         var posted = 0
+        var failed = 0
+        var retryableFailure = false
+        var lastError: String? = null
         var lastData = JSONObject()
-        for (offset in 0 until records.length() step 2000) {
-            val chunk = JSONArray()
-            for (i in offset until minOf(offset + 2000, records.length())) chunk.put(records.getJSONObject(i))
-            val body = JSONObject()
-                .put("source_id", config.sourceId)
-                .put("kind", "activity_detail_windows")
-                .put("external_batch_id", payload.optString("external_batch_id") + "-" + (offset / 2000))
-                .put("generated_at", payload.optString("generated_at"))
-                .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
-                .put("server_day", syncWindow.serverDay)
-                .put("activity_date", syncWindow.serverDay)
-                .put("timezone", "UTC")
-                .put("server_timezone", "UTC")
-                .put("window_from_utc", syncWindow.windowFromUtc.toString())
-                .put("window_to_utc", syncWindow.windowToUtc.toString())
-                .put("records", chunk)
-                .put("is_live_ui_only", false)
-                .put("source_of_truth", "health_connect")
-            val response = apiClient.postSourceSync(config, body, syncWindow.serverDay, sessionId)
-            lastData = response.optJSONObject("data") ?: JSONObject()
-            accepted += lastData.optInt("accepted_records", 0)
-            rejected += lastData.optInt("rejected_records", 0)
-            posted++
+        for (requestIndex in 0 until requests.length()) {
+            val request = requests.optJSONObject(requestIndex) ?: continue
+            val requestId = request.optLong("id", 0L)
+            var phase = "reading"
+            try {
+                apiClient.reportDetailProgress(config, requestId, phase, null, sessionId)
+                val payload = repository.buildDetailWindowsPayload(JSONArray().put(request), traceSessionId = sessionId)
+                val records = payload.optJSONArray("records") ?: JSONArray()
+                if (records.length() == 0) {
+                    failed++
+                    lastError = "no_native_evidence"
+                    apiClient.reportDetailProgress(config, requestId, "no_native_evidence", lastError, sessionId)
+                    continue
+                }
+                phase = "uploading"
+                // UTC request timestamps stay historical; nonce day stays current.
+                for (offset in 0 until records.length() step 1000) {
+                    val chunk = JSONArray()
+                    for (i in offset until minOf(offset + 1000, records.length())) chunk.put(records.getJSONObject(i))
+                    val body = JSONObject()
+                        .put("source_id", config.sourceId)
+                        .put("kind", "activity_detail_windows")
+                        .put("external_batch_id", payload.optString("external_batch_id") + "-" + (offset / 1000))
+                        .put("generated_at", payload.optString("generated_at"))
+                        .put("device_time", payload.optString("device_time", payload.optString("generated_at")))
+                        .put("server_day", syncWindow.serverDay)
+                        .put("activity_date", syncWindow.serverDay)
+                        .put("timezone", "UTC")
+                        .put("server_timezone", "UTC")
+                        .put("window_from_utc", syncWindow.windowFromUtc.toString())
+                        .put("window_to_utc", syncWindow.windowToUtc.toString())
+                        .put("records", chunk)
+                        .put("is_live_ui_only", false)
+                        .put("source_of_truth", "health_connect")
+                    logger.info(sessionId, "detail_requests", "chunk_upload_started", JSONObject()
+                        .put("detail_request_id", requestId).put("chunk_index", offset / 1000).put("chunk_records", chunk.length()))
+                    val response = apiClient.postSourceSync(config, body, syncWindow.serverDay, sessionId)
+                    lastData = response.optJSONObject("data") ?: JSONObject()
+                    logger.info(sessionId, "detail_requests", "chunk_upload_acknowledged", JSONObject()
+                        .put("detail_request_id", requestId).put("batch_id", lastData.optLong("batch_id", 0L)))
+                    accepted += lastData.optInt("accepted_records", 0)
+                    rejected += lastData.optInt("rejected_records", 0)
+                    posted++
+                }
+                apiClient.reportDetailProgress(config, requestId, "upload_queued", null, sessionId)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                failed++
+                retryableFailure = retryableFailure || isTransientFailure(error)
+                lastError = error.javaClass.simpleName.replace(Regex("[^a-zA-Z0-9_.:-]"), "_").take(120)
+                apiClient.reportDetailProgress(config, requestId,
+                    if (phase == "reading") "read_failed" else "upload_failed", lastError, sessionId)
+                logger.warn(sessionId, "detail_requests", "request_failed_will_retry", JSONObject()
+                    .put("detail_request_id", requestId).put("phase", phase), error)
+            }
         }
-        return result
-            .put("accepted", accepted)
-            .put("rejected", rejected)
-            .put("posted", posted)
+        return result.put("accepted", accepted).put("rejected", rejected).put("posted", posted)
+            .put("failed_requests", failed).put("retryable", retryableFailure).put("last_error", lastError ?: JSONObject.NULL)
+            .put("verification_state", if (failed > 0) "retry_pending" else "upload_queued")
             .put("authoritative_totals", lastData.optJSONObject("authoritative_totals") ?: JSONObject())
             .put("current_state", lastData.optJSONObject("current_state") ?: JSONObject())
+    }
+
+    private suspend fun awaitAggregateProcessing(config: HealthSyncConfig, batchId: Long, sessionId: String) {
+        for (delayMs in listOf(0L, 300L, 600L, 1200L, 2000L)) {
+            if (delayMs > 0) delay(delayMs)
+            if (apiClient.fetchSyncStatus(config, batchId, sessionId) != "processing") return
+        }
+        // Longer queue delays are recovered by the foreground/background loop.
+        logger.info(sessionId, "detail_requests", "aggregate_still_processing", JSONObject().put("batch_id", batchId))
     }
 
     private fun buildSourceSyncBody(

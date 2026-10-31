@@ -66,7 +66,7 @@ class HealthSyncApiClient(
     fun fetchDetailRequests(config: HealthSyncConfig, sessionId: String): JSONArray {
         // Pending requests may target previous UTC days. Never filter to today.
         val response = getJson(
-            "${config.apiBase}/api/v1/me/activity/detail-requests?limit=100",
+            "${config.apiBase}/api/v1/me/activity/detail-requests?limit=3&source_id=${config.sourceId}",
             config.token,
             sessionId,
             "detail_requests",
@@ -74,12 +74,35 @@ class HealthSyncApiClient(
         return response.optJSONObject("data")?.optJSONArray("requests") ?: JSONArray()
     }
 
+    fun fetchSyncStatus(config: HealthSyncConfig, batchId: Long, sessionId: String): String =
+        getJson("${config.apiBase}/api/v1/me/sources/sync-status/$batchId", config.token, sessionId, "sync_status")
+            .optJSONObject("data")?.optString("processing_status", "processing") ?: "processing"
+
+    fun reportDetailProgress(config: HealthSyncConfig, requestId: Long, state: String, errorCode: String?, sessionId: String) {
+        // Optional diagnostics must never prevent delivery of actual evidence.
+        runCatching {
+            postJsonForResponse("${config.apiBase}/api/v1/me/activity/detail-requests/$requestId/report",
+                config.token, JSONObject().put("state", state)
+                    .put("error_code", errorCode ?: JSONObject.NULL)
+                    .put("app_version", com.second.risedie.challengeapp.BuildConfig.VERSION_NAME),
+                sessionId, "detail_progress")
+        }.onFailure { logger.warn(sessionId, COMPONENT, "detail_progress_not_delivered", error = it) }
+    }
+
     fun postSourceSync(config: HealthSyncConfig, body: JSONObject, serverDay: String, sessionId: String): JSONObject {
         ActivityBatchEnvelope.prepare(body)
         val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId)
         if (pending != null) {
-            val response = sendSourceSync(config, pending, pending.optString("server_day", serverDay), sessionId)
-            if (pending.optString("idempotency_key") == body.optString("idempotency_key")) return response
+            // An immutable, definitively rejected outbox item must not block
+            // every later forensic request and ordinary sync forever.
+            val response = try {
+                sendSourceSync(config, pending, pending.optString("server_day", serverDay), sessionId)
+            } catch (error: IllegalStateException) {
+                if (credentials.readPendingActivityBatch() != null) throw error
+                logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
+                null
+            }
+            if (response != null && pending.optString("idempotency_key") == body.optString("idempotency_key")) return response
         }
         // Commit the frozen payload/key before the first network attempt, including nonce acquisition.
         check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
@@ -89,7 +112,14 @@ class HealthSyncApiClient(
 
     fun retryPendingSourceSync(config: HealthSyncConfig, sessionId: String) {
         val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId) ?: return
-        sendSourceSync(config, pending, pending.optString("server_day"), sessionId)
+        try {
+            sendSourceSync(config, pending, pending.optString("server_day"), sessionId)
+        } catch (error: IllegalStateException) {
+            // Only a terminal server HTTP rejection clears the persisted outbox.
+            // Session/security errors that left it intact must still surface.
+            if (credentials.readPendingActivityBatch() != null) throw error
+            logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
+        }
     }
 
     private fun sendSourceSync(config: HealthSyncConfig, body: JSONObject, serverDay: String, sessionId: String): JSONObject {
@@ -240,7 +270,7 @@ class HealthSyncApiClient(
             if (code !in 200..299) {
                 // A definitive ingress rejection cannot be repaired by retrying a frozen body.
                 // Keep uncertain deliveries, authentication failures and retryable server errors.
-                if (operation == "source_sync" && code in setOf(400, 404, 409, 413, 422)) {
+                if (operation == "source_sync" && code in setOf(400, 403, 404, 409, 413, 422)) {
                     if (sessionGeneration == NativeAuthSession.sessionGeneration()) NativeAuthSession.inSession(sessionGeneration) { credentials.clearPendingActivityBatch() }
                 }
                 if (code in setOf(408, 425, 429) || code >= 500) {
