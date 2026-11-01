@@ -71,6 +71,17 @@ class HealthSyncSourceContractTest {
     }
 
     @Test
+    fun metricReadFailuresCannotZeroOrSuppressSuccessfulOtherDiscipline() {
+        val repo = source("app/src/main/java/com/second/risedie/challengeapp/health/HealthConnectRepository.kt")
+        assertTrue(repo.contains("if (snapshot.diagnostics.stepsReadSuccess) aggregateRecords.put("))
+        assertTrue(repo.contains("if (snapshot.diagnostics.runReadSuccess) aggregateRecords.put("))
+        assertTrue(repo.contains("if (stepsRead.success) put(\"walk_steps\", walkSteps)"))
+        assertTrue(repo.contains("if (runningData.readSuccess) {"))
+        assertFalse(repo.contains("bestRunSnapshot\n            ?: return@withContext emptyPayload"))
+        assertTrue(repo.contains("token = response.pageToken?.takeIf { it.isNotBlank() }"))
+    }
+
+    @Test
     fun detailWindowsStayExplicitForensicBatch() {
         val repo = source("app/src/main/java/com/second/risedie/challengeapp/health/HealthConnectRepository.kt")
         assertTrue(repo.contains(".put(\"kind\", \"activity_detail_windows\")"))
@@ -84,6 +95,28 @@ class HealthSyncSourceContractTest {
         assertTrue(repo.contains("health_connect_records_seen"))
         assertTrue(repo.contains("health_connect_aggregate_seen"))
         assertTrue(repo.contains("server_day_ends_at_utc"))
+    }
+
+    @Test
+    fun currentDayIsDurablyPostedBeforeHistoricalProviderReads() {
+        val coordinator = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncCoordinator.kt")
+        val liveUpload = coordinator.indexOf("apiClient.postSourceSync(config, body, syncWindow.serverDay, sessionId)")
+        val history = coordinator.indexOf("syncPreviousDayWithoutBlockingCurrent(config, syncWindow, sessionId)")
+        val details = coordinator.indexOf("val detailAttempt = runCatching")
+        assertTrue(liveUpload > 0 && history > liveUpload && details > history)
+        assertTrue(coordinator.contains("skipped_after_grace_cutoff"))
+        assertTrue(coordinator.contains("deferred_provider_quota_cooldown"))
+    }
+
+    @Test
+    fun unchangedHistoricalHashIsRememberedEncryptedAfterServerReceipt() {
+        val api = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncApiClient.kt")
+        val credentials = source("app/src/main/java/com/second/risedie/challengeapp/security/SecureCredentialStore.kt")
+        assertTrue(api.contains("fun alreadyAcknowledgedDayClose("))
+        assertTrue(api.contains("if (status == \"settlement_open\") rememberDayCloseAcknowledgement("))
+        assertTrue(credentials.contains("fun writeAcknowledgedDayClose("))
+        assertTrue(credentials.contains("fun readAcknowledgedDayClose()"))
+        assertTrue(credentials.contains(".remove(KEY_DAY_CLOSE_ACK).remove(KEY_DAY_CLOSE_ACK_IV)"))
     }
 
     private fun source(relative: String): String = sequenceOf(

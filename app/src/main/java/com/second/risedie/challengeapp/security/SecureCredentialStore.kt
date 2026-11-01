@@ -46,6 +46,12 @@ class SecureCredentialStore(context: Context) {
     }
 
     @Synchronized
+    fun writeAcknowledgedDayClose(value: String) = persistEncrypted(value, KEY_DAY_CLOSE_ACK, KEY_DAY_CLOSE_ACK_IV)
+
+    @Synchronized
+    fun readAcknowledgedDayClose(): String? = decryptStored(KEY_DAY_CLOSE_ACK, KEY_DAY_CLOSE_ACK_IV)
+
+    @Synchronized
     fun writeAccessToken(token: String) {
         require(token.isNotBlank()) { "Access token must not be blank" }
         if (sessionToken("refresh") != null) {
@@ -103,6 +109,7 @@ class SecureCredentialStore(context: Context) {
             .remove(KEY_CIPHERTEXT).remove(KEY_IV)
             .remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV)
             .remove(KEY_SESSION).remove(KEY_SESSION_IV).remove(KEY_PENDING).remove(KEY_PENDING_IV)
+            .remove(KEY_DAY_CLOSE_ACK).remove(KEY_DAY_CLOSE_ACK_IV)
             .commit()
         clearLegacyTokens()
     }
@@ -174,6 +181,8 @@ class SecureCredentialStore(context: Context) {
         private const val KEY_SESSION_IV = "session_iv_v2"
         private const val KEY_PENDING = "pending_activity_ciphertext_v1"
         private const val KEY_PENDING_IV = "pending_activity_iv_v1"
+        private const val KEY_DAY_CLOSE_ACK = "accepted_day_close_ciphertext_v1"
+        private const val KEY_DAY_CLOSE_ACK_IV = "accepted_day_close_iv_v1"
         private const val KEY_CIPHERTEXT = "access_token_ciphertext_v1"
         private const val KEY_IV = "access_token_iv_v1"
         private const val KEY_REFRESH_CIPHERTEXT = "refresh_token_ciphertext_v1"

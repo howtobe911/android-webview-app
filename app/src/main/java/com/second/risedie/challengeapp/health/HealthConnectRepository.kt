@@ -34,6 +34,7 @@ data class ServerSyncWindow(
     val windowFromUtc: Instant,
     val windowToUtc: Instant,
     val serverDayEndsAtUtc: Instant,
+    val healthConnectWindowToken: String? = null,
 )
 
 class HealthConnectRepository(
@@ -172,7 +173,7 @@ class HealthConnectRepository(
     }
 
     /**
-     * Compatibility entry point. Steps and running distance are always read and sent together.
+     * Compatibility entry point. A failed reading never supplies a zero for another metric.
      */
     @Suppress("UNUSED_PARAMETER")
     suspend fun buildFreshCurrentDaySyncPayload(
@@ -189,10 +190,7 @@ class HealthConnectRepository(
         traceSessionId = traceSessionId,
     )
 
-    /**
-     * Compatibility entry point. includeRunDistance is intentionally ignored because the
-     * server-window snapshot is atomic: steps and running distance always travel together.
-     */
+    /** Each successful metric is sent; an unrelated read failure never manufactures zero. */
     @Suppress("UNUSED_PARAMETER")
     suspend fun buildFreshServerWindowSyncPayload(
         serverWindow: ServerSyncWindow,
@@ -203,7 +201,8 @@ class HealthConnectRepository(
     ): JSONObject = withContext(Dispatchers.IO) {
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
-        if (!hasPermissions()) {
+        val granted = grantedPermissions()
+        if (granted.intersect(dataPermissions).isEmpty()) {
             return@withContext emptyPayload("Разрешения Health Connect не выданы.")
         }
 
@@ -211,6 +210,7 @@ class HealthConnectRepository(
         var bestRunSnapshot: SyncSnapshot? = null
         var previousCompleteSnapshot: SyncSnapshot? = null
         var stableCompleteReads = 0
+        var quotaExceeded = false
         val allWarnings = linkedSetOf<String>()
         val attemptsTotal = attempts.coerceAtLeast(1)
 
@@ -221,7 +221,7 @@ class HealthConnectRepository(
                     .put("attempt", index + 1)
                     .put("attempts_total", attemptsTotal))
             }
-            val candidate = readSyncSnapshot(client, serverWindow)
+            val candidate = readSyncSnapshot(client, serverWindow, granted)
             allWarnings.addAll(candidate.diagnostics.warnings)
             traceSessionId?.let { sessionId ->
                 syncLogger?.info(sessionId, TRACE_COMPONENT, "read_attempt_completed", JSONObject()
@@ -232,7 +232,9 @@ class HealthConnectRepository(
                     .put("steps_records_seen", candidate.diagnostics.stepRecordsSeen)
                     .put("steps_read_success", candidate.diagnostics.stepsReadSuccess)
                     .put("run_read_success", candidate.diagnostics.runReadSuccess)
+                    .put("quota_exceeded", candidate.diagnostics.quotaExceeded)
                     .put("warnings_count", candidate.diagnostics.warnings.size)
+                    .put("read_warnings", candidate.diagnostics.warnings.toJsonArray())
                     .put("effective_window_to_utc", candidate.effectiveWindowToUtc.toString())
                     .put("duration_ms", (System.nanoTime() - attemptStarted) / 1_000_000))
             }
@@ -261,6 +263,14 @@ class HealthConnectRepository(
                 )
             ) {
                 bestRunSnapshot = candidate
+            }
+
+            // A provider quota error can happen AFTER a valid steps aggregate.
+            // Deliver that reading; do not perform another expensive HC read in
+            // the same run. The coordinator will enter cooldown after delivery.
+            if (candidate.diagnostics.quotaExceeded) {
+                quotaExceeded = true
+                break
             }
 
             if (candidate.diagnostics.readComplete) {
@@ -294,42 +304,49 @@ class HealthConnectRepository(
         }
 
         val stepsSnapshot = bestStepsSnapshot
-            ?: return@withContext emptyPayload(
-                "Health Connect не вернул достоверные данные шагов."
-            ).apply {
-                if (allWarnings.isNotEmpty()) put("warnings", allWarnings.toList().toJsonArray())
-            }
         val runSnapshot = bestRunSnapshot
-            ?: return@withContext emptyPayload(
-                "Health Connect не вернул достоверные данные беговой дистанции."
-            ).apply {
+        if (stepsSnapshot == null && runSnapshot == null) {
+            return@withContext emptyPayload("Health Connect не вернул ни одной достоверной метрики.").apply {
                 if (allWarnings.isNotEmpty()) put("warnings", allWarnings.toList().toJsonArray())
             }
-        val generatedAt = maxInstant(stepsSnapshot.generatedAt, runSnapshot.generatedAt)
+        }
+        val generatedAt = listOfNotNull(stepsSnapshot?.generatedAt, runSnapshot?.generatedAt).maxOrNull()!!
+        if (stepsSnapshot == null || runSnapshot == null) {
+            traceSessionId?.let { sessionId -> syncLogger?.warn(sessionId, TRACE_COMPONENT,
+                "partial_metric_read", JSONObject()
+                    .put("steps_available", stepsSnapshot != null)
+                    .put("run_available", runSnapshot != null)
+                    .put("warnings", allWarnings.toList().toJsonArray())) }
+        }
         traceSessionId?.let { sessionId ->
             syncLogger?.info(sessionId, TRACE_COMPONENT, "best_snapshot_selected", JSONObject()
-                .put("steps", stepsSnapshot.steps)
-                .put("run_meters", runSnapshot.runMeters)
-                .put("steps_generated_at", stepsSnapshot.generatedAt.toString())
-                .put("run_generated_at", runSnapshot.generatedAt.toString())
+                .put("steps_available", stepsSnapshot != null)
+                .put("run_available", runSnapshot != null)
+                .put("steps", stepsSnapshot?.steps ?: JSONObject.NULL)
+                .put("run_meters", runSnapshot?.runMeters ?: JSONObject.NULL)
+                .put("steps_generated_at", stepsSnapshot?.generatedAt?.toString() ?: JSONObject.NULL)
+                .put("run_generated_at", runSnapshot?.generatedAt?.toString() ?: JSONObject.NULL)
                 .put("warnings_count", allWarnings.size))
-            logStepsFreshnessDiagnostics(client, serverWindow, sessionId)
+            // Diagnostics must never issue extra provider reads ahead of a
+            // successfully measured metric: HC quotas are already restrictive.
         }
 
         val combined = SyncSnapshot(
-            steps = stepsSnapshot.steps,
-            runMeters = runSnapshot.runMeters,
+            steps = stepsSnapshot?.steps ?: 0L,
+            runMeters = runSnapshot?.runMeters ?: 0.0,
+            runSeconds = runSnapshot?.runSeconds ?: 0L,
             window = serverWindow,
-            effectiveWindowToUtc = maxInstant(
-                stepsSnapshot.effectiveWindowToUtc,
-                runSnapshot.effectiveWindowToUtc,
-            ),
+            effectiveWindowToUtc = listOfNotNull(
+                stepsSnapshot?.effectiveWindowToUtc,
+                runSnapshot?.effectiveWindowToUtc,
+            ).maxOrNull()!!,
             generatedAt = generatedAt,
             diagnostics = SyncDiagnostics(
-                stepsAggregateSeen = stepsSnapshot.diagnostics.stepsAggregateSeen,
-                stepRecordsSeen = stepsSnapshot.diagnostics.stepRecordsSeen,
-                stepsReadSuccess = true,
-                runReadSuccess = true,
+                stepsAggregateSeen = stepsSnapshot?.diagnostics?.stepsAggregateSeen ?: false,
+                stepRecordsSeen = stepsSnapshot?.diagnostics?.stepRecordsSeen ?: 0,
+                stepsReadSuccess = stepsSnapshot != null,
+                runReadSuccess = runSnapshot != null,
+                quotaExceeded = quotaExceeded,
                 warnings = allWarnings.toList(),
             ),
         )
@@ -340,10 +357,7 @@ class HealthConnectRepository(
         )
     }
 
-    /**
-     * Public signature is preserved for existing callers. includeRunDistance remains only for
-     * source and binary compatibility; both metrics are always included.
-     */
+    /** Compatibility path also uses sparse, per-metric measurements. */
     @Suppress("UNUSED_PARAMETER")
     suspend fun buildSyncPayload(
         serverWindow: ServerSyncWindow,
@@ -364,12 +378,13 @@ class HealthConnectRepository(
         }
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
-        if (!hasPermissions()) {
+        val granted = grantedPermissions()
+        if (granted.intersect(dataPermissions).isEmpty()) {
             return@withContext emptyPayload("Разрешения Health Connect не выданы.")
         }
 
-        val snapshot = readSyncSnapshot(client, serverWindow)
-        if (!snapshot.diagnostics.readComplete) {
+        val snapshot = readSyncSnapshot(client, serverWindow, granted)
+        if (!snapshot.diagnostics.stepsReadSuccess && !snapshot.diagnostics.runReadSuccess) {
             return@withContext incompleteSnapshotPayload(snapshot)
         }
 
@@ -474,9 +489,7 @@ class HealthConnectRepository(
             .also { traceSessionId?.let { sessionId -> syncLogger?.info(sessionId, TRACE_COMPONENT, "detail_read_completed", JSONObject().put("records_count", records.length())) } }
     }
 
-    /**
-     * Public signature is preserved. Running distance is always included.
-     */
+    /** A previous UTC day can be patched by any independently measured discipline. */
     @Suppress("UNUSED_PARAMETER")
     suspend fun buildDayCloseSnapshotPayload(
         activityDate: LocalDate,
@@ -486,7 +499,8 @@ class HealthConnectRepository(
         traceSessionId?.let { syncLogger?.info(it, TRACE_COMPONENT, "day_close_read_started", JSONObject().put("activity_date", activityDate.toString())) }
         val client = clientOrNull()
             ?: return@withContext emptyPayload("Health Connect недоступен.")
-        if (!hasPermissions()) {
+        val granted = grantedPermissions()
+        if (granted.intersect(dataPermissions).isEmpty()) {
             return@withContext emptyPayload("Разрешения Health Connect не выданы.")
         }
 
@@ -499,12 +513,26 @@ class HealthConnectRepository(
         }
 
         val warnings = mutableListOf<String>()
-        val stepsRead = readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
-        val runningData = readRunningActivityData(client, windowFromUtc, windowToUtc, warnings)
+        val stepsRead = if (granted.contains(stepsReadPermission)) {
+            readStepsTotal(client, windowFromUtc, windowToUtc, warnings)
+        } else StepsReadResult(0L, false, 0, false)
+        var quotaExceeded = false
+        val runningData = if (granted.containsAll(setOf(exerciseReadPermission, distanceReadPermission))) {
+            try {
+                readRunningActivityData(client, windowFromUtc, windowToUtc, warnings)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (!HealthConnectQuotaGuard.isQuotaExceeded(error) || !stepsRead.success) throw error
+                quotaExceeded = true
+                warnings.add("run_read_quota_exceeded_after_steps")
+                RunningActivityData(emptyList(), emptyList(), emptyList(), false, false)
+            }
+        } else RunningActivityData(emptyList(), emptyList(), emptyList(), false, false)
 
-        if (!stepsRead.success || !runningData.readSuccess) {
+        if (!stepsRead.success && !runningData.readSuccess) {
             return@withContext emptyPayload(
-                "Не удалось получить полный снимок Health Connect за закрытый UTC-день."
+                "Не удалось получить ни одной метрики Health Connect за закрытый UTC-день."
             ).apply {
                 if (warnings.isNotEmpty()) put("warnings", warnings.toJsonArray())
             }
@@ -519,9 +547,9 @@ class HealthConnectRepository(
                 activityDate.toString(),
                 windowFromUtc.toString(),
                 windowToUtc.toString(),
-                walkSteps.toString(),
-                formatMeters(normalizedRunMeters),
-                runSeconds.toString(),
+                if (stepsRead.success) "steps=$walkSteps" else "steps=ABSENT",
+                if (runningData.readSuccess) "meters=${formatMeters(normalizedRunMeters)}" else "meters=ABSENT",
+                if (runningData.readSuccess) "seconds=$runSeconds" else "seconds=ABSENT",
             ).joinToString("|")
         )
 
@@ -529,27 +557,33 @@ class HealthConnectRepository(
             .put("activity_date", activityDate.toString())
             .put("window_from_utc", windowFromUtc.toString())
             .put("window_to_utc", windowToUtc.toString())
-            .put("walk_steps", walkSteps)
-            .put("run_meters", normalizedRunMeters.toLong())
-            .put("run_seconds", runSeconds)
+            .apply { if (stepsRead.success) put("walk_steps", walkSteps) }
+            .apply { if (runningData.readSuccess) {
+                // The live importer rounds the same HC reading to an integer.
+                // Truncation here could create a false day-close mismatch.
+                put("run_meters", normalizedRunMeters.roundToLong())
+                put("run_seconds", runSeconds)
+            } }
             .put("source_hash", sourceHash)
             .put("external_batch_id", uniqueBatchId("android-day-close-${activityDate}", generatedAt))
             .put("generated_at", generatedAt.toString())
             .put("preferred_source", "health_connect")
             .put("source_of_truth", "health_connect_day_close_snapshot")
+            .apply { if (quotaExceeded) put("provider_quota_exceeded", true) }
             .apply {
                 if (warnings.isNotEmpty()) put("warnings", warnings.toJsonArray())
             }
             .also { traceSessionId?.let { sessionId -> syncLogger?.info(sessionId, TRACE_COMPONENT, "day_close_read_completed", JSONObject()
                 .put("activity_date", activityDate.toString())
-                .put("walk_steps", walkSteps)
-                .put("run_meters", normalizedRunMeters)
+                .put("walk_steps", if (stepsRead.success) walkSteps else JSONObject.NULL)
+                .put("run_meters", if (runningData.readSuccess) normalizedRunMeters else JSONObject.NULL)
                 .put("warnings_count", warnings.size)) } }
     }
 
     private data class SyncSnapshot(
         val steps: Long,
         val runMeters: Double,
+        val runSeconds: Long,
         val window: ServerSyncWindow,
         val effectiveWindowToUtc: Instant,
         val generatedAt: Instant,
@@ -561,6 +595,7 @@ class HealthConnectRepository(
         val stepRecordsSeen: Int,
         val stepsReadSuccess: Boolean,
         val runReadSuccess: Boolean,
+        val quotaExceeded: Boolean = false,
         val warnings: List<String>,
     ) {
         val readComplete: Boolean
@@ -612,6 +647,7 @@ class HealthConnectRepository(
     private suspend fun readSyncSnapshot(
         client: HealthConnectClient,
         serverWindow: ServerSyncWindow,
+        granted: Set<String>,
     ): SyncSnapshot {
         val generatedAt = Instant.now()
         val effectiveTo = minInstant(serverWindow.windowToUtc, generatedAt)
@@ -621,6 +657,7 @@ class HealthConnectRepository(
             return SyncSnapshot(
                 steps = 0L,
                 runMeters = 0.0,
+                runSeconds = 0L,
                 window = serverWindow,
                 effectiveWindowToUtc = effectiveTo,
                 generatedAt = generatedAt,
@@ -634,23 +671,28 @@ class HealthConnectRepository(
             )
         }
 
-        val stepsRead = readStepsTotal(
-            client = client,
-            from = serverWindow.windowFromUtc,
-            to = effectiveTo,
-            warnings = warnings,
-        )
+        val stepsRead = if (granted.contains(stepsReadPermission)) {
+            readStepsTotal(client, serverWindow.windowFromUtc, effectiveTo, warnings)
+        } else StepsReadResult(0L, false, 0, false)
 
-        val runningData = readRunningActivityData(
-            client = client,
-            from = serverWindow.windowFromUtc,
-            to = effectiveTo,
-            warnings = warnings,
-        )
+        var quotaExceeded = false
+        val runningData = if (granted.containsAll(setOf(exerciseReadPermission, distanceReadPermission))) {
+            try {
+                readRunningActivityData(client, serverWindow.windowFromUtc, effectiveTo, warnings)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (!HealthConnectQuotaGuard.isQuotaExceeded(error) || !stepsRead.success) throw error
+                quotaExceeded = true
+                warnings.add("run_read_quota_exceeded_after_steps")
+                RunningActivityData(emptyList(), emptyList(), emptyList(), false, false)
+            }
+        } else RunningActivityData(emptyList(), emptyList(), emptyList(), false, false)
 
         return SyncSnapshot(
             steps = stepsRead.total,
             runMeters = normalizeTwoDecimals(runningData.totalMeters),
+            runSeconds = runningData.totalDurationSeconds,
             window = serverWindow,
             effectiveWindowToUtc = effectiveTo,
             generatedAt = generatedAt,
@@ -659,6 +701,7 @@ class HealthConnectRepository(
                 stepRecordsSeen = stepsRead.recordsSeen,
                 stepsReadSuccess = stepsRead.success,
                 runReadSuccess = runningData.readSuccess,
+                quotaExceeded = quotaExceeded,
                 warnings = warnings,
             ),
         )
@@ -687,7 +730,7 @@ class HealthConnectRepository(
         val normalizedDistance = normalizeTwoDecimals(snapshot.runMeters)
 
         val aggregateRecords = JSONArray()
-            .put(
+        if (snapshot.diagnostics.stepsReadSuccess) aggregateRecords.put(
                 JSONObject()
                     .put("activity_type", "walk")
                     .put("metric_type", "steps")
@@ -702,7 +745,7 @@ class HealthConnectRepository(
                     .put("client_generated_at", now.toString())
                     .put("device_time", now.toString())
             )
-            .put(
+        if (snapshot.diagnostics.runReadSuccess) aggregateRecords.put(
                 JSONObject()
                     .put("activity_type", "run")
                     .put("metric_type", "meters")
@@ -715,6 +758,21 @@ class HealthConnectRepository(
                     .put("client_generated_at", now.toString())
                     .put("device_time", now.toString())
             )
+        if (snapshot.diagnostics.runReadSuccess) aggregateRecords.put(
+                JSONObject()
+                    .put("activity_type", "run")
+                    .put("metric_type", "run_duration")
+                    .put("value", snapshot.runSeconds)
+                    .put("recorded_from", windowFromUtc.toString())
+                    .put("recorded_to", windowToUtc.toString())
+                    .put("window_from_utc", windowFromUtc.toString())
+                    .put("window_to_utc", windowToUtc.toString())
+                    .put("server_timezone", window.serverTimezone)
+                    .put("client_generated_at", now.toString())
+                    .put("device_time", now.toString())
+            )
+
+        if (aggregateRecords.length() == 0) return emptyPayload("Достоверных метрик нет.")
 
         val aggregateSourceHash = sha256(
             listOf(
@@ -723,8 +781,9 @@ class HealthConnectRepository(
                 window.serverTimezone,
                 windowFromUtc.toString(),
                 windowToUtc.toString(),
-                snapshot.steps.toString(),
-                formatMeters(normalizedDistance),
+                if (snapshot.diagnostics.stepsReadSuccess) "steps=${snapshot.steps}" else "steps=ABSENT",
+                if (snapshot.diagnostics.runReadSuccess) "meters=${formatMeters(normalizedDistance)}" else "meters=ABSENT",
+                if (snapshot.diagnostics.runReadSuccess) "seconds=${snapshot.runSeconds}" else "seconds=ABSENT",
             ).joinToString("|")
         )
 
@@ -758,6 +817,7 @@ class HealthConnectRepository(
             .put("preferred_source", "health_connect")
             .put("provider", providerPayload())
             .apply {
+                if (snapshot.diagnostics.quotaExceeded) put("provider_quota_exceeded", true)
                 if (snapshot.diagnostics.warnings.isNotEmpty()) {
                     put("warnings", snapshot.diagnostics.warnings.toJsonArray())
                 }
@@ -829,12 +889,20 @@ class HealthConnectRepository(
         }
 
         return try {
-            val records = client.readRecords(
-                ReadRecordsRequest(
+            val records = mutableListOf<StepsRecord>()
+            val seenTokens = mutableSetOf<String>()
+            var token: String? = null
+            var pages = 0
+            do {
+                val response = client.readRecords(ReadRecordsRequest(
                     recordType = StepsRecord::class,
-                    timeRangeFilter = TimeRangeFilter.between(from, to),
-                )
-            ).records
+                    timeRangeFilter = TimeRangeFilter.between(from, to), pageToken = token))
+                records.addAll(response.records)
+                token = response.pageToken?.takeIf { it.isNotBlank() }
+                if (token != null) check(seenTokens.add(token)) { "Health Connect steps pagination token repeated" }
+                pages++
+                check(pages < 200 || token == null) { "Health Connect steps pagination limit reached" }
+            } while (token != null)
 
             var total = 0.0
             for (record in records) {
@@ -872,6 +940,7 @@ class HealthConnectRepository(
         from: Instant,
         to: Instant,
         warnings: MutableList<String>,
+        includeDistance: Boolean = true,
     ): RunningActivityData {
         if (!to.isAfter(from)) {
             return RunningActivityData(
@@ -886,13 +955,15 @@ class HealthConnectRepository(
         val originalSessions = try {
             val all = mutableListOf<ExerciseSessionRecord>()
             var token: String? = null
+            val seenTokens = mutableSetOf<String>()
             var pages = 0
             do {
                 val response = client.readRecords(ReadRecordsRequest(
                     recordType = ExerciseSessionRecord::class,
                     timeRangeFilter = TimeRangeFilter.between(from, to), pageToken = token))
                 all.addAll(response.records)
-                token = response.pageToken
+                token = response.pageToken?.takeIf { it.isNotBlank() }
+                if (token != null) check(seenTokens.add(token)) { "Health Connect session pagination token repeated" }
                 pages++
                 check(pages < 200 || token == null) { "Health Connect session pagination limit reached" }
             } while (token != null)
@@ -923,6 +994,18 @@ class HealthConnectRepository(
                 if (clippedTo.isAfter(clippedFrom)) TimeInterval(clippedFrom, clippedTo) else null
             }
         )
+        if (!includeDistance) {
+            // Exercise duration is measured from session boundaries alone.
+            // Reading DistanceRecord here wastes quota and, for users who
+            // granted only exercise access, can make valid evidence fail.
+            return RunningActivityData(
+                originalSessions = originalSessions,
+                coverageIntervals = coverageIntervals,
+                distanceSegments = emptyList(),
+                sessionsReadSuccess = true,
+                distanceReadSuccess = false,
+            )
+        }
         if (coverageIntervals.isEmpty()) {
             return RunningActivityData(
                 originalSessions = originalSessions,
@@ -936,13 +1019,15 @@ class HealthConnectRepository(
         val records = try {
             val all = mutableListOf<DistanceRecord>()
             var token: String? = null
+            val seenTokens = mutableSetOf<String>()
             var pages = 0
             do {
                 val response = client.readRecords(ReadRecordsRequest(
                     recordType = DistanceRecord::class,
                     timeRangeFilter = TimeRangeFilter.between(from, to), pageToken = token))
                 all.addAll(response.records)
-                token = response.pageToken
+                token = response.pageToken?.takeIf { it.isNotBlank() }
+                if (token != null) check(seenTokens.add(token)) { "Health Connect distance pagination token repeated" }
                 pages++
                 check(pages < 200 || token == null) { "Health Connect distance pagination limit reached" }
             } while (token != null)
@@ -1201,6 +1286,7 @@ class HealthConnectRepository(
                 val records = try {
                     val all = mutableListOf<StepsRecord>()
                     var token: String? = null
+                    val seenTokens = mutableSetOf<String>()
                     var pages = 0
                     do {
                         // A long verification interval can exceed one Health Connect page.
@@ -1213,7 +1299,8 @@ class HealthConnectRepository(
                             )
                         )
                         all.addAll(response.records)
-                        token = response.pageToken
+                        token = response.pageToken?.takeIf { it.isNotBlank() }
+                        if (token != null) check(seenTokens.add(token)) { "Health Connect detail pagination token repeated" }
                         pages++
                         check(pages < 200 || token == null) { "Health Connect detail pagination limit reached" }
                     } while (token != null)
@@ -1221,6 +1308,7 @@ class HealthConnectRepository(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
+                    if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
                     // Prefer a second independent Health Connect *minute-bucketed*
                     // read over declaring the entire request empty. Never reuse the
                     // original unverified daily aggregate as evidence.
@@ -1248,6 +1336,7 @@ class HealthConnectRepository(
                     } catch (error: CancellationException) {
                         throw error
                     } catch (error: Exception) {
+                        if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
                         throw IllegalStateException("Health Connect detailed steps records and bucketed aggregate unavailable", error)
                     }
                     for (group in groups) {
@@ -1269,7 +1358,7 @@ class HealthConnectRepository(
             }
 
             "run_duration", "run_workout_seconds", "workout" -> {
-                val runningData = readRunningActivityData(client, from, to, warnings)
+                val runningData = readRunningActivityData(client, from, to, warnings, includeDistance = false)
                 check(runningData.sessionsReadSuccess) { "Incomplete Health Connect run duration evidence" }
                 for (interval in runningData.coverageIntervals) {
                     distributeValue(

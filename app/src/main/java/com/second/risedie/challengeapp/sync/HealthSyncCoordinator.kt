@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 
@@ -46,6 +47,11 @@ class HealthSyncCoordinator(context: Context) {
 
         val quotaDelay = quotaGuard.remainingMillis()
         if (quotaDelay > 0L) {
+            // HC provider quota must not block already measured and durably
+            // queued activity from reaching the backend over the network.
+            val flush = runCatching { apiClient.retryPendingSourceSync(config, sessionId) }
+            flush.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            flush.onFailure { logger.warn(sessionId, "api_client", "quota_outbox_delivery_pending", error = it) }
             logger.info(sessionId, "health_reader", "quota_cooldown_active", JSONObject()
                 .put("retry_after_ms", quotaDelay))
             return@withContext JSONObject()
@@ -55,6 +61,7 @@ class HealthSyncCoordinator(context: Context) {
                 .put("reason", reason)
                 .put("request_id", sessionId)
                 .put("retry_after_ms", quotaDelay)
+                .put("outbox_retry_pending", flush.isFailure)
                 .put("synced_at", Instant.now().toString())
         }
 
@@ -64,53 +71,27 @@ class HealthSyncCoordinator(context: Context) {
             return@withContext failure("unavailable", reason, sessionId, "Health Connect is unavailable")
         }
 
-        val permissionsGranted = repository.hasPermissions()
-        logger.info(sessionId, "health_reader", "permissions_state", JSONObject().put("data_permissions_granted", permissionsGranted))
-        if (!permissionsGranted) {
-            val granted = runCatching { repository.grantedPermissions() }.getOrDefault(emptySet())
-            // Missing RUN permissions must not strand a WALK investigation.
-            // Do not publish a partial daily aggregate as complete run data.
-            val stepPermission = granted.contains(repository.stepsReadPermission)
-            if (stepPermission) {
-                val forensic = runCatching {
-                    val window = apiClient.fetchSyncWindow(config, sessionId)
-                    postPendingDetailRequests(config, window, sessionId)
-                }
-                forensic.exceptionOrNull()?.let { if (it is CancellationException) throw it }
-                forensic.onFailure { logger.warn(sessionId, "detail_requests", "partial_permission_recovery_failed", error = it) }
-                return@withContext failure("no_permissions", reason, sessionId,
-                    "Full Health Connect permissions are required for daily totals; available steps detail was checked")
-                    .put("detail_verification_requests", forensic.getOrNull()?.optInt("pending_requests", 0) ?: 0)
-                    .put("detail_verification_pending_retry", forensic.isFailure)
-                    .put("detail_verification_error", forensic.exceptionOrNull()?.javaClass?.simpleName ?: JSONObject.NULL)
-            }
-            return@withContext failure("no_permissions", reason, sessionId, "Health Connect step permission is missing")
+        val granted = repository.grantedPermissions()
+        val canReadSteps = granted.contains(repository.stepsReadPermission)
+        val canReadRun = granted.containsAll(setOf(repository.exerciseReadPermission, repository.distanceReadPermission))
+        logger.info(sessionId, "health_reader", "permissions_state", JSONObject()
+            .put("data_permissions_granted", granted.containsAll(repository.dataPermissions))
+            .put("steps_permission", canReadSteps)
+            .put("run_permission", canReadRun))
+        if (!canReadSteps && !canReadRun) {
+            return@withContext failure("no_permissions", reason, sessionId, "Health Connect reading permissions are missing")
         }
 
         try {
             val syncWindow = apiClient.fetchSyncWindow(config, sessionId)
             require(syncWindow.serverTimezone == "UTC") { "Backend sync-window must use UTC" }
 
-            apiClient.retryPendingSourceSync(config, sessionId)
-            // Old verification windows can expire sooner than the current-day snapshot.
-            // Give outstanding detail requests first priority on every reconnection.
-            val detailAttempt = runCatching {
-                postPendingDetailRequests(config, syncWindow, sessionId)
-            }
-            var detailError = detailAttempt.exceptionOrNull()
-            detailError?.let { if (it is CancellationException) throw it }
-            // A provider-wide quota error must stop *all* reads for this run.
-            detailError?.let { if (HealthConnectQuotaGuard.isQuotaExceeded(it)) throw it }
-            detailError?.let { error ->
-                // Do not silently classify a failed evidence read/upload as success.
-                // The request remains requested server-side and will be retried on
-                // the next sync; ordinary fresh-day telemetry may still proceed.
-                logger.warn(sessionId, "detail_requests", "verification_pending_retry", JSONObject()
-                    .put("error_class", error.javaClass.simpleName)
-                    .put("retryable", isTransientFailure(error)), error)
-            }
-            var detailResult = detailAttempt.getOrNull()
-            postPreviousDayCloseSnapshotIfNeeded(config, syncWindow, sessionId)
+            // A stale outbox HTTP timeout must not prevent today's independent
+            // metric reads. Pending bytes remain in the encrypted queue and
+            // will be retried on the next pass.
+            val replay = runCatching { apiClient.retryPendingSourceSync(config, sessionId) }
+            replay.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            replay.onFailure { logger.warn(sessionId, "api_client", "outbox_replay_deferred_current_read_continues", error = it) }
 
             logger.info(sessionId, "health_reader", "read_started", JSONObject()
                 .put("attempts", READ_ATTEMPTS)
@@ -126,7 +107,13 @@ class HealthSyncCoordinator(context: Context) {
                 delayMillis = READ_DELAY_MS,
                 traceSessionId = sessionId,
             )
-            quotaGuard.recordSuccessfulRead()
+            val providerQuotaExceeded = payload.optBoolean("provider_quota_exceeded", false)
+            val quotaRetryAfterMs = if (providerQuotaExceeded) {
+                (quotaGuard.recordQuotaExceeded() - System.currentTimeMillis()).coerceAtLeast(0L)
+            } else {
+                quotaGuard.recordSuccessfulRead()
+                0L
+            }
             payload.put("preferred_source", "health_connect")
             val payloadSummary = logPayloadSummary(sessionId, payload, readStarted)
             logger.info(sessionId, "health_reader", "health_connect_snapshot", JSONObject(payloadSummary.toString())
@@ -138,12 +125,12 @@ class HealthSyncCoordinator(context: Context) {
                 logger.info(sessionId, "health_reader", "no_current_batches_detail_requests_still_checked")
             }
 
-            var accepted = detailResult?.optInt("accepted", 0) ?: 0
+            var accepted = 0
             var duplicate = 0
-            var rejected = detailResult?.optInt("rejected", 0) ?: 0
-            var posted = detailResult?.optInt("posted", 0) ?: 0
-            var currentState: JSONObject? = detailResult?.optJSONObject("current_state")?.takeIf { it.length() > 0 }
-            var totals: JSONObject? = detailResult?.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 }
+            var rejected = 0
+            var posted = 0
+            var currentState: JSONObject? = null
+            var totals: JSONObject? = null
 
             var lastAggregateBatchId = 0L
             for (index in 0 until batches.length()) {
@@ -172,24 +159,41 @@ class HealthSyncCoordinator(context: Context) {
                 if (kind == "health_connect_aggregate") lastAggregateBatchId = data.optLong("batch_id", 0L)
             }
 
-            // HTTP 202 only means queued. The investigation is created by the
-            // importer AFTER that ACK, so a poll before uploading cannot see it.
-            if (lastAggregateBatchId > 0L && (detailResult?.optInt("pending_requests", 0) ?: 0) == 0) {
-                val followUp = runCatching {
-                    awaitAggregateProcessing(config, lastAggregateBatchId, sessionId)
-                    postPendingDetailRequests(config, syncWindow, sessionId)
+            // Preserve scarce provider quota for live activity first. Once it
+            // has reached the durable HTTP outbox, read yesterday (if still
+            // in grace) and then inspect the detail requests it may create.
+            syncPreviousDayWithoutBlockingCurrent(config, syncWindow, sessionId)
+
+            // Unverified historical details never block today's HTTP upload.
+            // The 202 importer runs asynchronously: wait briefly before the
+            // FIRST request fetch, rather than fetching every request twice.
+            if (lastAggregateBatchId > 0L) {
+                runCatching { awaitAggregateProcessing(config, lastAggregateBatchId, sessionId) }
+                    .onFailure { if (it is CancellationException) throw it }
+            }
+            val detailAttempt = runCatching {
+                if (quotaGuard.remainingMillis() > 0L) {
+                    logger.info(sessionId, "detail_requests", "deferred_provider_quota_cooldown")
+                    JSONObject().put("deferred_quota", true)
+                } else postPendingDetailRequests(config, syncWindow, sessionId)
+            }
+            val detailError = detailAttempt.exceptionOrNull()
+            if (detailError is CancellationException) throw detailError
+            detailError?.let { error ->
+                if (HealthConnectQuotaGuard.isQuotaExceeded(error)) {
+                    quotaGuard.recordQuotaExceeded()
                 }
-                val followUpError = followUp.exceptionOrNull()
-                if (followUpError is CancellationException) throw followUpError
-                detailError = followUpError
-                followUp.getOrNull()?.let { recovered ->
-                    detailResult = recovered
-                    accepted += recovered.optInt("accepted", 0)
-                    rejected += recovered.optInt("rejected", 0)
-                    posted += recovered.optInt("posted", 0)
-                    currentState = recovered.optJSONObject("current_state")?.takeIf { it.length() > 0 } ?: currentState
-                    totals = recovered.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 } ?: totals
-                }
+                logger.warn(sessionId, "detail_requests", "verification_pending_retry", JSONObject()
+                    .put("error_class", error.javaClass.simpleName)
+                    .put("retryable", isTransientFailure(error)), error)
+            }
+            val detailResult = detailAttempt.getOrNull()
+            detailResult?.let { recovered ->
+                accepted += recovered.optInt("accepted", 0)
+                rejected += recovered.optInt("rejected", 0)
+                posted += recovered.optInt("posted", 0)
+                currentState = recovered.optJSONObject("current_state")?.takeIf { it.length() > 0 } ?: currentState
+                totals = recovered.optJSONObject("authoritative_totals")?.takeIf { it.length() > 0 } ?: totals
             }
 
             // Preserve the original no-data contract if neither the current-day
@@ -202,11 +206,18 @@ class HealthSyncCoordinator(context: Context) {
                     .put("detail_verification_error", detailError?.javaClass?.simpleName ?: detailResult?.optString("last_error")?.takeIf { it.isNotBlank() } ?: JSONObject.NULL)
             }
 
-            val type = if (accepted > 0 || duplicate > 0 || currentState != null || posted > 0) "success" else "no_data"
-            val fresh = type == "success"
             val sourceSyncHttpStatus = apiClient.sourceSyncHttpCode()
             val requestDelivered = sourceSyncHttpStatus != null && sourceSyncHttpStatus in 200..299
             val serverProcessingQueued = sourceSyncHttpStatus == 202
+            // A 202 response is only an enqueue ACK: neither the user's totals
+            // nor the successful-sync timestamp may advance before processing.
+            val serverConfirmed = accepted > 0 || duplicate > 0 || currentState != null
+            val type = when {
+                serverConfirmed -> "success"
+                posted > 0 || serverProcessingQueued -> "queued"
+                else -> "no_data"
+            }
+            val fresh = serverConfirmed
             val serverAccepted = accepted > 0 || serverProcessingQueued
             val serverStateChanged = accepted > 0
             val result = JSONObject()
@@ -226,9 +237,11 @@ class HealthSyncCoordinator(context: Context) {
                 .put("detail_verification_error", detailError?.javaClass?.simpleName ?: detailResult?.optString("last_error")?.takeIf { it.isNotBlank() } ?: JSONObject.NULL)
                 .put("detail_verification_retryable", (detailError?.let { isTransientFailure(it) } ?: false) || (detailResult?.optBoolean("retryable", false) ?: false))
                 .put("detail_verification_requests", detailResult?.optInt("pending_requests", 0) ?: 0)
-                .put("steps", payloadSummary.optLong("steps", 0L))
-                .put("run_meters", payloadSummary.optDouble("run_meters", 0.0))
+                .put("steps", if (payloadSummary.has("steps")) payloadSummary.optLong("steps") else JSONObject.NULL)
+                .put("run_meters", if (payloadSummary.has("run_meters")) payloadSummary.optDouble("run_meters") else JSONObject.NULL)
                 .put("records_count", payloadSummary.optInt("records_count", 0))
+                .put("provider_quota_exceeded", providerQuotaExceeded)
+                .put("retry_after_ms", quotaRetryAfterMs)
                 .put("http_status", sourceSyncHttpStatus ?: JSONObject.NULL)
                 .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
                 .put("request_delivered", requestDelivered)
@@ -248,9 +261,11 @@ class HealthSyncCoordinator(context: Context) {
                 .put("accepted_records", accepted)
                 .put("duplicate_records", duplicate)
                 .put("rejected_records", rejected)
-                .put("steps", payloadSummary.optLong("steps", 0L))
-                .put("run_meters", payloadSummary.optDouble("run_meters", 0.0))
+                .put("steps", if (payloadSummary.has("steps")) payloadSummary.optLong("steps") else JSONObject.NULL)
+                .put("run_meters", if (payloadSummary.has("run_meters")) payloadSummary.optDouble("run_meters") else JSONObject.NULL)
                 .put("records_count", payloadSummary.optInt("records_count", 0))
+                .put("provider_quota_exceeded", providerQuotaExceeded)
+                .put("retry_after_ms", quotaRetryAfterMs)
                 .put("http_status", sourceSyncHttpStatus ?: JSONObject.NULL)
                 .put("last_http_status", apiClient.lastHttpCode() ?: JSONObject.NULL)
                 .put("request_delivered", requestDelivered)
@@ -310,17 +325,63 @@ class HealthSyncCoordinator(context: Context) {
         syncWindow: ServerSyncWindow,
         sessionId: String,
     ) {
+        val graceDeadline = Instant.parse("${syncWindow.serverDay}T00:00:00Z")
+            .plus(Duration.ofHours(GRACE_WINDOW_HOURS))
+        if (!syncWindow.windowToUtc.isBefore(graceDeadline)) {
+            logger.info(sessionId, "day_close", "skipped_after_grace_cutoff")
+            return
+        }
         val previousDay = LocalDate.parse(syncWindow.serverDay).minusDays(1)
         logger.info(sessionId, "day_close", "read_started", JSONObject().put("activity_date", previousDay.toString()))
         val payload = repository.buildDayCloseSnapshotPayload(previousDay, includeRunDistance = true, traceSessionId = sessionId)
+        if (payload.optBoolean("provider_quota_exceeded", false)) {
+            // A valid historical steps reading must still reach the server.
+            // Only additional HC reads are deferred until quota replenishes.
+            quotaGuard.recordQuotaExceeded()
+        }
         if (payload.optString("activity_date").isBlank()) {
             logger.info(sessionId, "day_close", "skipped_no_data")
             return
         }
         val body = JSONObject(payload.toString()).put("source_id", config.sourceId)
-        runCatching { apiClient.postDayClose(config, body, sessionId) }
-            .onSuccess { logger.info(sessionId, "day_close", "posted") }
-            .onFailure { logger.warn(sessionId, "day_close", "post_failed", error = it) }
+        if (apiClient.alreadyAcknowledgedDayClose(config, body)) {
+            logger.info(sessionId, "day_close", "unchanged_snapshot_already_acknowledged", JSONObject()
+                .put("activity_date", previousDay.toString()))
+            return
+        }
+        try {
+            apiClient.postDayClose(config, body, sessionId)
+            logger.info(sessionId, "day_close", "posted")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
+            logger.warn(sessionId, "day_close", "post_failed", error = error)
+        }
+    }
+
+    private suspend fun syncPreviousDayWithoutBlockingCurrent(
+        config: HealthSyncConfig,
+        syncWindow: ServerSyncWindow,
+        sessionId: String,
+    ) {
+        if (quotaGuard.remainingMillis() > 0L) {
+            logger.info(sessionId, "day_close", "deferred_provider_quota_cooldown")
+            return
+        }
+        try {
+            postPreviousDayCloseSnapshotIfNeeded(config, syncWindow, sessionId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (HealthConnectQuotaGuard.isQuotaExceeded(error)) {
+                val retryAt = quotaGuard.recordQuotaExceeded()
+                logger.warn(sessionId, "day_close", "quota_after_current_day_uploaded", JSONObject()
+                    .put("retry_after_ms", (retryAt - System.currentTimeMillis()).coerceAtLeast(0L)), error)
+            } else {
+                logger.warn(sessionId, "day_close", "historical_read_retry_pending", error = error)
+            }
+        }
     }
 
     private suspend fun postPendingDetailRequests(
@@ -391,6 +452,7 @@ class HealthSyncCoordinator(context: Context) {
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
+                if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
                 failed++
                 retryableFailure = retryableFailure || isTransientFailure(error)
                 lastError = error.javaClass.simpleName.replace(Regex("[^a-zA-Z0-9_.:-]"), "_").take(120)
@@ -440,6 +502,11 @@ class HealthSyncCoordinator(context: Context) {
         .put("health_connect_read_at", payload.optString("generated_at"))
         .put("client_observed_at", payload.optString("device_time", payload.optString("generated_at")))
         .apply {
+            if (batch.optString("kind") == "health_connect_aggregate") {
+                put("health_connect_window_token", requireNotNull(syncWindow.healthConnectWindowToken) {
+                    "Health Connect aggregate requires its signed server window"
+                })
+            }
             if (batch.has("window_size_minutes")) put("window_size_minutes", batch.optInt("window_size_minutes", 15))
         }
 
@@ -520,8 +587,11 @@ class HealthSyncCoordinator(context: Context) {
     companion object {
         private val processSyncMutex = Mutex()
         private const val COMPONENT = "coordinator"
-        private const val READ_ATTEMPTS = 2
+        // One bounded provider read per scheduled run. Repeated full-day queries
+        // every few seconds exhaust HC quotas and delay already valid metrics.
+        private const val READ_ATTEMPTS = 1
         private const val READ_DELAY_MS = 750L
+        private const val GRACE_WINDOW_HOURS = 10L
         private val WINDOW_KINDS = setOf("walk_steps_windows", "activity_windows", "activity_detail_windows")
     }
 }

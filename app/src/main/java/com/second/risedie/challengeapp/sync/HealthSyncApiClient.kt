@@ -36,7 +36,7 @@ class HealthSyncApiClient(
     fun fetchSyncWindow(config: HealthSyncConfig, sessionId: String): ServerSyncWindow {
         sessionGeneration = config.sessionGeneration
         logger.info(sessionId, COMPONENT, "sync_window_request")
-        val response = getJson("${config.apiBase}/api/v1/me/activity/sync-window", config.token, sessionId, "sync_window")
+        val response = getJson("${config.apiBase}/api/v1/me/activity/sync-window?source_id=${config.sourceId}", config.token, sessionId, "sync_window")
         val data = response.optJSONObject("data") ?: response
         val serverDay = data.optString("server_day")
         val windowFrom = data.optString("window_from_utc")
@@ -45,12 +45,15 @@ class HealthSyncApiClient(
         require(serverDay.isNotBlank() && windowFrom.isNotBlank() && windowTo.isNotBlank() && endsAt.isNotBlank()) {
             "Incomplete server sync window"
         }
+        val sealedToken = data.optString("health_connect_window_token")
+        require(sealedToken.isNotBlank()) { "Backend did not issue a replay-safe Health Connect window" }
         val window = ServerSyncWindow(
             serverDay = serverDay,
             serverTimezone = data.optString("server_timezone", "UTC"),
             windowFromUtc = parseServerInstant(windowFrom),
             windowToUtc = parseServerInstant(windowTo),
             serverDayEndsAtUtc = parseServerInstant(endsAt),
+            healthConnectWindowToken = sealedToken,
         )
         logger.info(sessionId, COMPONENT, "sync_window_response", JSONObject()
             .put("server_day", window.serverDay)
@@ -91,34 +94,98 @@ class HealthSyncApiClient(
 
     fun postSourceSync(config: HealthSyncConfig, body: JSONObject, serverDay: String, sessionId: String): JSONObject {
         ActivityBatchEnvelope.prepare(body)
-        val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId)
-        if (pending != null) {
-            // An immutable, definitively rejected outbox item must not block
-            // every later forensic request and ordinary sync forever.
-            val response = try {
-                sendSourceSync(config, pending, pending.optString("server_day", serverDay), sessionId)
-            } catch (error: IllegalStateException) {
-                if (credentials.readPendingActivityBatch() != null) throw error
-                logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
-                null
-            }
-            if (response != null && pending.optString("idempotency_key") == body.optString("idempotency_key")) return response
-        }
-        // Commit the frozen payload/key before the first network attempt, including nonce acquisition.
         check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
-        NativeAuthSession.inSession(sessionGeneration) { credentials.writePendingActivityBatch(ActivityBatchEnvelope.stored(config.apiBase, config.sourceId, body)) }
-        return sendSourceSync(config, body, serverDay, sessionId)
+        val items = readOutbox(config)
+        val key = body.optString("idempotency_key")
+        var item = items.firstOrNull { it.optJSONObject("body")?.optString("idempotency_key") == key }
+        if (item == null) {
+            item = JSONObject()
+                .put("body", JSONObject(body.toString()))
+                .put("server_day", serverDay)
+                .put("batch_id", 0L)
+            items.add(item)
+            writeOutbox(config, items) // Before the first nonce or HTTP request.
+        }
+        val existingBatchId = item.optLong("batch_id", 0L)
+        if (existingBatchId > 0L) {
+            return JSONObject().put("success", true)
+                .put("data", JSONObject().put("batch_id", existingBatchId))
+                .put("meta", JSONObject().put("queued", true))
+        }
+        try {
+            val response = sendSourceSync(config, item.getJSONObject("body"), serverDay, sessionId)
+            item.put("batch_id", response.optJSONObject("data")!!.optLong("batch_id"))
+            writeOutbox(config, items) // 202 is queue admission, not processed.
+            return response
+        } catch (error: TerminalSourceSyncRejection) {
+            items.remove(item)
+            writeOutbox(config, items)
+            logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
+            throw error
+        }
     }
 
     fun retryPendingSourceSync(config: HealthSyncConfig, sessionId: String) {
-        val pending = ActivityBatchEnvelope.pending(credentials.readPendingActivityBatch(), config.apiBase, config.sourceId) ?: return
-        try {
-            sendSourceSync(config, pending, pending.optString("server_day"), sessionId)
-        } catch (error: IllegalStateException) {
-            // Only a terminal server HTTP rejection clears the persisted outbox.
-            // Session/security errors that left it intact must still surface.
-            if (credentials.readPendingActivityBatch() != null) throw error
-            logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
+        sessionGeneration = config.sessionGeneration
+        val items = readOutbox(config)
+        for (item in items.sortedBy { if (it.optString("endpoint") == "day_close") 0 else 1 }
+            .take(MAX_OUTBOX_REPLAY_PER_RUN)) {
+            val body = item.optJSONObject("body") ?: continue
+            val batchId = item.optLong("batch_id", 0L)
+            try {
+                if (item.optString("endpoint") == "day_close") {
+                    val close = sendDayClose(config, body, sessionId)
+                    val status = close.optJSONObject("data")?.optString("status", "") ?: ""
+                    if (status == "settlement_open") rememberDayCloseAcknowledgement(config, body)
+                    else logger.warn(sessionId, COMPONENT, "day_close_outbox_not_accepted", JSONObject().put("status", status))
+                    items.remove(item)
+                    writeOutbox(config, items)
+                    continue
+                }
+                if (batchId > 0L) {
+                    val processingStatus = fetchSyncStatus(config, batchId, sessionId)
+                    when (processingStatus) {
+                        "processed", "detail_pending" -> {
+                            items.remove(item)
+                            writeOutbox(config, items)
+                        }
+                        "rejected", "failed" -> {
+                            logger.warn(sessionId, COMPONENT, "outbox_processing_rejected", JSONObject()
+                                .put("batch_id", batchId).put("processing_status", processingStatus))
+                            items.remove(item)
+                            writeOutbox(config, items)
+                        }
+                        else -> Unit // Still queued; keep immutable payload for the next run.
+                    }
+                } else {
+                    val response = sendSourceSync(config, body, item.optString("server_day"), sessionId)
+                    item.put("batch_id", response.optJSONObject("data")!!.optLong("batch_id"))
+                    writeOutbox(config, items)
+                }
+            } catch (error: TerminalSourceSyncRejection) {
+                if (batchId > 0L && error.httpCode == 404) {
+                    // Expired/unknown receipt: resend the SAME frozen logical key.
+                    item.put("batch_id", 0L)
+                } else {
+                    items.remove(item)
+                    logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_batch", error = error)
+                }
+                writeOutbox(config, items)
+            }
+        }
+    }
+
+    private fun readOutbox(config: HealthSyncConfig): MutableList<JSONObject> = ActivityBatchEnvelope.queue(
+        credentials.readPendingActivityBatch(), config.apiBase, config.sourceId,
+    )
+
+    private fun writeOutbox(config: HealthSyncConfig, items: List<JSONObject>) {
+        check(sessionGeneration == NativeAuthSession.sessionGeneration()) { "Native session changed" }
+        NativeAuthSession.inSession(sessionGeneration) {
+            if (items.isEmpty()) credentials.clearPendingActivityBatch()
+            else credentials.writePendingActivityBatch(ActivityBatchEnvelope.storedQueue(
+                config.apiBase, config.sourceId, items,
+            ))
         }
     }
 
@@ -130,12 +197,59 @@ class HealthSyncApiClient(
         if (!response.optBoolean("success") || response.optJSONObject("data")?.optLong("batch_id", 0L)?.let { it > 0L } != true) {
             throw java.io.IOException("Missing source-sync acknowledgement")
         }
-        // A lost 202 or process death leaves the same envelope for the next attempt.
-        if (sessionGeneration == NativeAuthSession.sessionGeneration()) NativeAuthSession.inSession(sessionGeneration) { credentials.clearPendingActivityBatch() }
+        // A 202 is not a processed receipt; the encrypted FIFO owns this batch
+        // until sync-status confirms backend import or definitive rejection.
         return response
     }
 
-    fun postDayClose(config: HealthSyncConfig, body: JSONObject, sessionId: String): JSONObject =
+    /** Reusing a settled source hash saves HTTP and prevents request churn. */
+    fun alreadyAcknowledgedDayClose(config: HealthSyncConfig, body: JSONObject): Boolean {
+        val stored = credentials.readAcknowledgedDayClose() ?: return false
+        val ack = runCatching { JSONObject(stored) }.getOrNull() ?: return false
+        return ack.optString("api_base") == config.apiBase
+            && ack.optLong("source_id") == config.sourceId
+            && ack.optString("activity_date") == body.optString("activity_date")
+            && ack.optString("source_hash").isNotBlank()
+            && ack.optString("source_hash") == body.optString("source_hash")
+    }
+
+    private fun rememberDayCloseAcknowledgement(config: HealthSyncConfig, body: JSONObject) {
+        credentials.writeAcknowledgedDayClose(JSONObject()
+            .put("api_base", config.apiBase)
+            .put("source_id", config.sourceId)
+            .put("activity_date", body.optString("activity_date"))
+            .put("source_hash", body.optString("source_hash"))
+            .toString())
+    }
+
+    fun postDayClose(config: HealthSyncConfig, body: JSONObject, sessionId: String): JSONObject {
+        val items = readOutbox(config)
+        val key = body.optString("activity_date") + ":" + body.optString("source_hash")
+        var item = items.firstOrNull { it.optString("endpoint") == "day_close"
+            && it.optString("logical_key") == key }
+        if (item == null) {
+            item = JSONObject().put("endpoint", "day_close").put("logical_key", key)
+                .put("body", JSONObject(body.toString()))
+            items.add(item)
+            writeOutbox(config, items)
+        }
+        try {
+            val response = sendDayClose(config, item.getJSONObject("body"), sessionId)
+            val status = response.optJSONObject("data")?.optString("status", "") ?: ""
+            if (status == "settlement_open") rememberDayCloseAcknowledgement(config, item.getJSONObject("body"))
+            else logger.warn(sessionId, COMPONENT, "day_close_outbox_not_accepted", JSONObject().put("status", status))
+            items.remove(item)
+            writeOutbox(config, items)
+            return response
+        } catch (error: TerminalSourceSyncRejection) {
+            items.remove(item)
+            writeOutbox(config, items)
+            logger.warn(sessionId, COMPONENT, "discarded_terminal_pending_day_close", error = error)
+            throw error
+        }
+    }
+
+    private fun sendDayClose(config: HealthSyncConfig, body: JSONObject, sessionId: String): JSONObject =
         postJsonForResponse(
             "${config.apiBase}/api/v1/me/activity/health-connect/day-close-sync",
             config.token,
@@ -270,8 +384,9 @@ class HealthSyncApiClient(
             if (code !in 200..299) {
                 // A definitive ingress rejection cannot be repaired by retrying a frozen body.
                 // Keep uncertain deliveries, authentication failures and retryable server errors.
-                if (operation == "source_sync" && code in setOf(400, 403, 404, 409, 413, 422)) {
-                    if (sessionGeneration == NativeAuthSession.sessionGeneration()) NativeAuthSession.inSession(sessionGeneration) { credentials.clearPendingActivityBatch() }
+                if (operation in setOf("source_sync", "sync_status", "day_close")
+                    && code in setOf(400, 403, 404, 409, 413, 422)) {
+                    throw TerminalSourceSyncRejection(code, operation)
                 }
                 if (code in setOf(408, 425, 429) || code >= 500) {
                     throw java.io.IOException("$operation temporarily failed with HTTP $code")
@@ -307,5 +422,9 @@ class HealthSyncApiClient(
 
     companion object {
         private const val COMPONENT = "api_client"
+        private const val MAX_OUTBOX_REPLAY_PER_RUN = 6
     }
+
+    private class TerminalSourceSyncRejection(val httpCode: Int, operation: String) :
+        IllegalStateException("$operation definitively rejected with HTTP $httpCode")
 }

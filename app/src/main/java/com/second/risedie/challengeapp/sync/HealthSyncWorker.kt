@@ -59,7 +59,7 @@ class HealthSyncWorker(
             }
             val resultType = syncResult.optString("type", "unknown")
             val workResult = when (resultType) {
-                "success", "no_data", "no_permissions", "not_configured", "unavailable", "quota_cooldown" -> "success"
+                "success", "queued", "no_data", "no_permissions", "not_configured", "unavailable", "quota_cooldown" -> "success"
                 "transient_failure" -> "retry"
                 "failed" -> "failure"
                 else -> "failure"
@@ -73,8 +73,8 @@ class HealthSyncWorker(
                 .put("server_processing_queued", syncResult.optBoolean("server_processing_queued", false))
                 .put("server_state_changed", syncResult.optBoolean("server_state_changed", false))
                 .put("server_updated", syncResult.optBoolean("server_state_changed", false))
-                .put("steps", syncResult.optLong("steps", 0L))
-                .put("run_meters", syncResult.optDouble("run_meters", 0.0))
+                .put("steps", if (syncResult.isNull("steps") || !syncResult.has("steps")) JSONObject.NULL else syncResult.optLong("steps"))
+                .put("run_meters", if (syncResult.isNull("run_meters") || !syncResult.has("run_meters")) JSONObject.NULL else syncResult.optDouble("run_meters"))
                 .put("retry_after_ms", syncResult.optLong("retry_after_ms", 0L))
                 .put("records_count", syncResult.optInt("records_count", 0))
                 .put("http_status", syncResult.opt("http_status") ?: JSONObject.NULL)
