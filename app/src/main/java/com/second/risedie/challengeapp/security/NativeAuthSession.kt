@@ -90,7 +90,13 @@ class NativeAuthSession(context: Context) {
 
     private fun clearSyncConfiguration() {
         appContext.getSharedPreferences("grafit_native_health_sync", Context.MODE_PRIVATE)
-            .edit().remove("source_id").remove("api_base").remove("last_successful_foreground_sync_at").commit()
+            .edit().remove("source_id").remove("api_base").remove("last_successful_foreground_sync_at")
+            .remove("last_read_source").remove("last_read_day").remove("last_read_ms")
+            .remove("last_read_fingerprint")
+            .remove("day_close_read_source").remove("day_close_read_day").remove("day_close_read_ms")
+            .remove("last_batch_source").remove("last_batch_day").remove("last_batch_ms")
+            .remove("last_batch_fingerprint").remove("last_batch_status").remove("last_batch_id")
+            .commit()
     }
 
     private fun acceptCredentials(payload: JSONObject, expectedGeneration: Long): Boolean {

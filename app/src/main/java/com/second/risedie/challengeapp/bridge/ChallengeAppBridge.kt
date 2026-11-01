@@ -16,6 +16,7 @@ import androidx.health.connect.client.PermissionController
 import com.second.risedie.challengeapp.BuildConfig
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.LiveStepTracker
+import com.second.risedie.challengeapp.ui.ChallengeWebViewActivity
 import com.second.risedie.challengeapp.sync.ForegroundHealthSyncEngine
 import com.second.risedie.challengeapp.sync.HealthSyncWorker
 import com.second.risedie.challengeapp.sync.HealthSyncLogger
@@ -299,10 +300,9 @@ class ChallengeAppBridge(
 
         foregroundSyncEngine.configure(normalizedToken, normalizedApiBase, normalizedSourceId)
         HealthSyncWorker.enqueuePeriodic(context)
-        // A one-time constrained job survives a power cycle or app going to background;
-        // it will fetch still-open historical detail requests when connectivity returns.
-        HealthSyncWorker.enqueueImmediate(context)
-        foregroundSyncEngine.startForegroundLoop()
+        // Foreground startup/resume owns the immediate request. Reconnect/boot
+        // are the only events allowed to schedule the constrained recovery job.
+        if (ChallengeWebViewActivity.isInForeground) foregroundSyncEngine.startForegroundLoop()
 
         runCatching { PushTokenRegistrar.configure(context, normalizedToken, normalizedApiBase) }
             .onFailure { healthSyncLogger.warn("configuration", "bridge", "push_configuration_failed_non_blocking", error = it) }
@@ -313,8 +313,8 @@ class ChallengeAppBridge(
             .put("configured", true)
             .put("source_id", normalizedSourceId)
             .put("server_timezone", "UTC")
-            .put("foreground_loop_min_seconds", 90)
-            .put("foreground_loop_max_seconds", 180)
+            .put("foreground_loop_min_seconds", 120)
+            .put("foreground_loop_max_seconds", 120)
             .put("immediate_sync_queued", false)
             .toString()
     }

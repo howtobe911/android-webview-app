@@ -59,7 +59,7 @@ class HealthSyncWorker(
             }
             val resultType = syncResult.optString("type", "unknown")
             val workResult = when (resultType) {
-                "success", "queued", "no_data", "no_permissions", "not_configured", "unavailable", "quota_cooldown" -> "success"
+                "success", "queued", "throttled", "no_data", "no_permissions", "not_configured", "unavailable", "quota_cooldown" -> "success"
                 "transient_failure" -> "retry"
                 "failed" -> "failure"
                 else -> "failure"
@@ -85,11 +85,6 @@ class HealthSyncWorker(
 
             when (workResult) {
                 "success" -> {
-                    if (scheduleKind == SCHEDULE_KIND_NEXT) {
-                        enqueueNext(applicationContext, ExistingWorkPolicy.APPEND_OR_REPLACE)
-                    } else {
-                        enqueueNext(applicationContext, ExistingWorkPolicy.KEEP)
-                    }
                     logger.info(sessionId, COMPONENT, "background_worker_completed", fields)
                     Result.success()
                 }
@@ -140,9 +135,7 @@ class HealthSyncWorker(
         private const val PERIODIC_WORK = "grafit_health_connect_periodic_sync"
         private const val IMMEDIATE_WORK = "grafit_health_connect_immediate_sync"
         private const val NEXT_WORK = "grafit_health_connect_next_sync"
-        private const val NEXT_DELAY_MINUTES = 15L
         private const val INPUT_SCHEDULE_KIND = "schedule_kind"
-        private const val SCHEDULE_KIND_NEXT = "next"
 
         fun cancelAll(context: Context) {
             val manager = WorkManager.getInstance(context.applicationContext)
@@ -188,6 +181,15 @@ class HealthSyncWorker(
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             val workManager = WorkManager.getInstance(appContext)
+            // One-time NEXT was a second perpetual 15-minute scheduler in older builds.
+            // Cancel only that legacy chain once; keep periodic and reconnect work.
+            val prefs = appContext.getSharedPreferences(HealthSyncConfigStore.PREFS, Context.MODE_PRIVATE)
+            if (!prefs.getBoolean("legacy_next_work_retired_v1", false)) {
+                workManager.cancelUniqueWork(NEXT_WORK)
+                prefs.edit().putBoolean("legacy_next_work_retired_v1", true).apply()
+                logger.info("scheduler", COMPONENT, "legacy_next_work_retired", JSONObject()
+                    .put("unique_name", NEXT_WORK))
+            }
             logger.info("scheduler", COMPONENT, "periodic_work_registration_started", JSONObject()
                 .put("unique_name", PERIODIC_WORK)
                 .put("policy", "KEEP")
@@ -232,27 +234,6 @@ class HealthSyncWorker(
                             .put("policy", "KEEP"))
                     }
             }, { runnable -> runnable.run() })
-            enqueueNext(appContext, ExistingWorkPolicy.KEEP)
-        }
-
-        private fun enqueueNext(context: Context, policy: ExistingWorkPolicy) {
-            val appContext = context.applicationContext
-            if (HealthSyncConfigStore(appContext).load() == null) return
-            val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build()
-            val request = OneTimeWorkRequestBuilder<HealthSyncWorker>()
-                .setInputData(Data.Builder().putString(INPUT_SCHEDULE_KIND, SCHEDULE_KIND_NEXT).build())
-                .setInitialDelay(NEXT_DELAY_MINUTES, TimeUnit.MINUTES)
-                .setConstraints(constraints)
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
-                .build()
-            WorkManager.getInstance(appContext)
-                .enqueueUniqueWork(NEXT_WORK, policy, request)
-            HealthSyncLogger(appContext).info("scheduler", COMPONENT, "next_work_enqueued", JSONObject()
-                .put("unique_name", NEXT_WORK)
-                .put("delay_minutes", NEXT_DELAY_MINUTES)
-                .put("policy", policy.name))
         }
     }
 }

@@ -93,6 +93,37 @@ class HealthSyncPipelineContractTest {
         assertTrue(s.contains("\"transient_failure\" -> \"retry\""))
     }
 
+    @Test
+    fun foregroundAndBackgroundShareTwoMinuteCadence() {
+        val cadence = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncCadence.kt")
+        val coordinator = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncCoordinator.kt")
+        val foreground = source("app/src/main/java/com/second/risedie/challengeapp/sync/ForegroundHealthSyncEngine.kt")
+        assertTrue(cadence.contains("READ_INTERVAL_MS = 2 * 60_000L"))
+        assertTrue(coordinator.contains("cadence.readIsRecent(config.sourceId, syncWindow.serverDay)"))
+        assertTrue(coordinator.contains("reason != \"manual_refresh\""))
+        assertTrue(foreground.contains("FOREGROUND_LOOP_INTERVAL_MS = 120_000L"))
+        assertTrue(foreground.contains("syncRequested.compareAndSet(false, true)"))
+    }
+
+    @Test
+    fun aggregateHeartbeatAndServerReceiptAreNotConfused() {
+        val cadence = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncCadence.kt")
+        val coordinator = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncCoordinator.kt")
+        val api = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncApiClient.kt")
+        assertTrue(cadence.contains("HEARTBEAT_INTERVAL_MS = 15 * 60_000L"))
+        assertTrue(cadence.contains("values.sorted().joinToString"))
+        assertTrue(coordinator.contains("aggregateProcessingStatus == \"processed\""))
+        assertTrue(coordinator.contains("aggregate_processing_finished"))
+        assertTrue(api.contains("cadence.updateReceiptStatus"))
+    }
+
+    @Test
+    fun duplicateBackgroundChainIsRetired() {
+        val worker = source("app/src/main/java/com/second/risedie/challengeapp/sync/HealthSyncWorker.kt")
+        assertTrue(worker.contains("cancelUniqueWork(NEXT_WORK)"))
+        assertFalse(worker.contains("enqueueNext("))
+    }
+
     private fun source(relative: String): String = sequenceOf(
         File(relative), File(relative.removePrefix("app/")),
     ).firstOrNull { it.isFile }?.readText() ?: error("Source not found: $relative")

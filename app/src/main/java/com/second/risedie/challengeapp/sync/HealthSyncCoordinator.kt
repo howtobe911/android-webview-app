@@ -25,6 +25,7 @@ class HealthSyncCoordinator(context: Context) {
     private val repository = HealthConnectRepository(appContext, logger)
     private val apiClient = HealthSyncApiClient(appContext, logger)
     private val quotaGuard = HealthConnectQuotaGuard(appContext)
+    private val cadence = HealthSyncCadence(appContext)
 
     fun configure(token: String, apiBase: String, sourceId: Long) {
         configStore.save(token, apiBase, sourceId)
@@ -93,6 +94,25 @@ class HealthSyncCoordinator(context: Context) {
             replay.exceptionOrNull()?.let { if (it is CancellationException) throw it }
             replay.onFailure { logger.warn(sessionId, "api_client", "outbox_replay_deferred_current_read_continues", error = it) }
 
+            // All entry points share this persisted two-minute guard. Manual
+            // refresh bypasses it; a new UTC day always starts a fresh read.
+            if (reason != "manual_refresh" && cadence.readIsRecent(config.sourceId, syncWindow.serverDay)) {
+                val confirmed = cadence.recentProcessedRead(config.sourceId, syncWindow.serverDay)
+                logger.info(sessionId, COMPONENT, "provider_read_throttled", JSONObject()
+                    .put("reason", reason).put("read_interval_ms", HealthSyncCadence.READ_INTERVAL_MS)
+                    .put("server_processed", confirmed))
+                return@withContext JSONObject()
+                    .put("type", if (confirmed) "success" else "throttled")
+                    .put("success", confirmed)
+                    .put("fresh", confirmed)
+                    .put("request_id", sessionId)
+                    .put("reason", reason)
+                    .put("server_day", syncWindow.serverDay)
+                    .put("server_processing_status", if (confirmed) "processed" else "not_confirmed")
+                    .put("should_reload_snapshot", confirmed)
+                    .put("synced_at", Instant.now().toString())
+            }
+
             logger.info(sessionId, "health_reader", "read_started", JSONObject()
                 .put("attempts", READ_ATTEMPTS)
                 .put("delay_ms", READ_DELAY_MS)
@@ -121,6 +141,17 @@ class HealthSyncCoordinator(context: Context) {
                 .put("window_to_utc", syncWindow.windowToUtc.toString()))
 
             val batches = payload.optJSONArray("batches") ?: JSONArray()
+            if (!providerQuotaExceeded) {
+                var currentAggregate: JSONArray? = null
+                for (index in 0 until batches.length()) {
+                    val batch = batches.optJSONObject(index) ?: continue
+                    if (batch.optString("kind") == "health_connect_aggregate") {
+                        currentAggregate = batch.optJSONArray("records")
+                        break
+                    }
+                }
+                cadence.noteRead(config.sourceId, syncWindow.serverDay, currentAggregate)
+            }
             if (batches.length() == 0) {
                 logger.info(sessionId, "health_reader", "no_current_batches_detail_requests_still_checked")
             }
@@ -133,6 +164,10 @@ class HealthSyncCoordinator(context: Context) {
             var totals: JSONObject? = null
 
             var lastAggregateBatchId = 0L
+            var lastAggregateRecords: JSONArray? = null
+            var aggregateAlreadyProcessed = false
+            var aggregateUploadPending = false
+            var skippedAggregateStatus = "not_posted"
             for (index in 0 until batches.length()) {
                 val batch = batches.optJSONObject(index) ?: continue
                 val kind = batch.optString("kind")
@@ -142,6 +177,18 @@ class HealthSyncCoordinator(context: Context) {
                 }
                 val records = batch.optJSONArray("records") ?: JSONArray()
                 if (records.length() == 0) continue
+
+                if (kind == "health_connect_aggregate" &&
+                    cadence.aggregateIsRecent(config.sourceId, syncWindow.serverDay, records)) {
+                    aggregateAlreadyProcessed = cadence.aggregateWasProcessed(config.sourceId, syncWindow.serverDay, records)
+                    aggregateUploadPending = !aggregateAlreadyProcessed
+                    skippedAggregateStatus = cadence.aggregateStatus(config.sourceId, syncWindow.serverDay, records)
+                    logger.info(sessionId, "payload_builder", "unchanged_aggregate_skipped", JSONObject()
+                        .put("heartbeat_interval_ms", HealthSyncCadence.HEARTBEAT_INTERVAL_MS)
+                        .put("server_processed", aggregateAlreadyProcessed)
+                        .put("records_count", records.length()))
+                    continue
+                }
 
                 val body = buildSourceSyncBody(config.sourceId, batch, payload, syncWindow)
                 logger.info(sessionId, "payload_builder", "batch_built", JSONObject()
@@ -156,7 +203,14 @@ class HealthSyncCoordinator(context: Context) {
                 currentState = data.optJSONObject("current_state") ?: currentState
                 totals = data.optJSONObject("authoritative_totals") ?: totals
                 posted += 1
-                if (kind == "health_connect_aggregate") lastAggregateBatchId = data.optLong("batch_id", 0L)
+                if (kind == "health_connect_aggregate") {
+                    lastAggregateBatchId = data.optLong("batch_id", 0L)
+                    lastAggregateRecords = records
+                    if (lastAggregateBatchId > 0L) {
+                        cadence.noteReceipt(config.sourceId, syncWindow.serverDay, records,
+                            "processing", lastAggregateBatchId)
+                    }
+                }
             }
 
             // Preserve scarce provider quota for live activity first. Once it
@@ -167,9 +221,15 @@ class HealthSyncCoordinator(context: Context) {
             // Unverified historical details never block today's HTTP upload.
             // The 202 importer runs asynchronously: wait briefly before the
             // FIRST request fetch, rather than fetching every request twice.
-            if (lastAggregateBatchId > 0L) {
-                runCatching { awaitAggregateProcessing(config, lastAggregateBatchId, sessionId) }
-                    .onFailure { if (it is CancellationException) throw it }
+            val aggregateProcessingStatus = if (lastAggregateBatchId > 0L) {
+                val processing = runCatching { awaitAggregateProcessing(config, lastAggregateBatchId, sessionId) }
+                processing.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                processing.onFailure { logger.warn(sessionId, "api_client", "aggregate_confirmation_deferred", error = it) }
+                processing.getOrNull() ?: "processing"
+            } else skippedAggregateStatus
+            if (lastAggregateBatchId > 0L && lastAggregateRecords != null) {
+                cadence.updateReceiptStatus(config.sourceId, syncWindow.serverDay,
+                    lastAggregateRecords, aggregateProcessingStatus)
             }
             val detailAttempt = runCatching {
                 if (quotaGuard.remainingMillis() > 0L) {
@@ -208,17 +268,22 @@ class HealthSyncCoordinator(context: Context) {
 
             val sourceSyncHttpStatus = apiClient.sourceSyncHttpCode()
             val requestDelivered = sourceSyncHttpStatus != null && sourceSyncHttpStatus in 200..299
-            val serverProcessingQueued = sourceSyncHttpStatus == 202
+            val serverProcessingQueued = sourceSyncHttpStatus == 202 || aggregateUploadPending
             // A 202 response is only an enqueue ACK: neither the user's totals
             // nor the successful-sync timestamp may advance before processing.
-            val serverConfirmed = accepted > 0 || duplicate > 0 || currentState != null
+            // Detail or day-close acknowledgements must never masquerade as
+            // confirmation that the current Health Connect aggregate imported.
+            val serverConfirmed = if (lastAggregateBatchId > 0L || aggregateAlreadyProcessed || aggregateUploadPending) {
+                aggregateProcessingStatus == "processed"
+            } else accepted > 0 || duplicate > 0 || currentState != null
             val type = when {
+                aggregateProcessingStatus in setOf("rejected", "failed") -> "failed"
                 serverConfirmed -> "success"
                 posted > 0 || serverProcessingQueued -> "queued"
                 else -> "no_data"
             }
-            val fresh = serverConfirmed
-            val serverAccepted = accepted > 0 || serverProcessingQueued
+            val fresh = type == "success"
+            val serverAccepted = serverConfirmed || serverProcessingQueued
             val serverStateChanged = accepted > 0
             val result = JSONObject()
                 .put("type", type)
@@ -247,6 +312,7 @@ class HealthSyncCoordinator(context: Context) {
                 .put("request_delivered", requestDelivered)
                 .put("server_accepted", serverAccepted)
                 .put("server_processing_queued", serverProcessingQueued)
+                .put("server_processing_status", aggregateProcessingStatus)
                 .put("server_state_changed", serverStateChanged)
                 .put("server_updated", serverStateChanged)
                 .put("authoritative_totals", totals ?: JSONObject())
@@ -271,6 +337,7 @@ class HealthSyncCoordinator(context: Context) {
                 .put("request_delivered", requestDelivered)
                 .put("server_accepted", serverAccepted)
                 .put("server_processing_queued", serverProcessingQueued)
+                .put("server_processing_status", aggregateProcessingStatus)
                 .put("server_state_changed", serverStateChanged)
                 .put("server_updated", serverStateChanged)
                 .put("duration_ms", (System.nanoTime() - started) / 1_000_000))
@@ -332,8 +399,17 @@ class HealthSyncCoordinator(context: Context) {
             return
         }
         val previousDay = LocalDate.parse(syncWindow.serverDay).minusDays(1)
+        if (cadence.dayCloseIsRecent(config.sourceId, previousDay.toString())) {
+            logger.info(sessionId, "day_close", "read_throttled", JSONObject()
+                .put("activity_date", previousDay.toString())
+                .put("retry_after_max_ms", HealthSyncCadence.HEARTBEAT_INTERVAL_MS))
+            return
+        }
         logger.info(sessionId, "day_close", "read_started", JSONObject().put("activity_date", previousDay.toString()))
         val payload = repository.buildDayCloseSnapshotPayload(previousDay, includeRunDistance = true, traceSessionId = sessionId)
+        if (!payload.optBoolean("provider_quota_exceeded", false)) {
+            cadence.noteDayCloseRead(config.sourceId, previousDay.toString())
+        }
         if (payload.optBoolean("provider_quota_exceeded", false)) {
             // A valid historical steps reading must still reach the server.
             // Only additional HC reads are deferred until quota replenishes.
@@ -469,13 +545,19 @@ class HealthSyncCoordinator(context: Context) {
             .put("current_state", lastData.optJSONObject("current_state") ?: JSONObject())
     }
 
-    private suspend fun awaitAggregateProcessing(config: HealthSyncConfig, batchId: Long, sessionId: String) {
-        for (delayMs in listOf(0L, 300L, 600L, 1200L, 2000L)) {
+    private suspend fun awaitAggregateProcessing(config: HealthSyncConfig, batchId: Long, sessionId: String): String {
+        for (delayMs in listOf(0L, 250L, 500L, 1000L, 1500L, 2000L)) {
             if (delayMs > 0) delay(delayMs)
-            if (apiClient.fetchSyncStatus(config, batchId, sessionId) != "processing") return
+            val status = apiClient.fetchSyncStatus(config, batchId, sessionId)
+            if (status != "processing") {
+                logger.info(sessionId, "api_client", "aggregate_processing_finished", JSONObject()
+                    .put("batch_id", batchId).put("processing_status", status))
+                return status
+            }
         }
-        // Longer queue delays are recovered by the foreground/background loop.
-        logger.info(sessionId, "detail_requests", "aggregate_still_processing", JSONObject().put("batch_id", batchId))
+        // The encrypted outbox retains 202 until a later sync-status confirms it.
+        logger.info(sessionId, "api_client", "aggregate_still_processing", JSONObject().put("batch_id", batchId))
+        return "processing"
     }
 
     private fun buildSourceSyncBody(

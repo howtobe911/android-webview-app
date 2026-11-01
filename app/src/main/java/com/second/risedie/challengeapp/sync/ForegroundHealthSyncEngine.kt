@@ -20,7 +20,6 @@ import org.json.JSONObject
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.random.Random
 
 /** Owns only foreground scheduling, concurrency and WebView event delivery. */
 class ForegroundHealthSyncEngine(
@@ -33,6 +32,8 @@ class ForegroundHealthSyncEngine(
     private val logger = HealthSyncLogger(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
+    private val syncRequested = AtomicBoolean(false)
+    @Volatile private var activeRequestId: String? = null
 
     @Volatile private var foreground = false
     @Volatile private var loopJob: Job? = null
@@ -44,7 +45,18 @@ class ForegroundHealthSyncEngine(
     fun requestForegroundSync(reason: String): JSONObject {
         val normalizedReason = reason.ifBlank { "manual_refresh" }
         val requestId = UUID.randomUUID().toString()
+        if (mutex.isLocked || !syncRequested.compareAndSet(false, true)) {
+            val existing = activeRequestId
+            logger.info(requestId, COMPONENT, "sync_joined_existing", JSONObject()
+                .put("reason", normalizedReason).put("active_request_id", existing ?: JSONObject.NULL))
+            return if (existing != null) JSONObject().put("queued", true).put("joined_existing", true)
+                .put("reason", normalizedReason).put("request_id", existing)
+            else JSONObject().put("queued", false).put("type", "skipped_already_running")
+                .put("success", false).put("fresh", false)
+                .put("reason", normalizedReason).put("request_id", requestId)
+        }
         if (normalizedReason == "app_start" && !appStartRequested.compareAndSet(false, true)) {
+            syncRequested.set(false)
             logger.info(requestId, COMPONENT, "sync_skipped_duplicate_app_start")
             return JSONObject()
                 .put("queued", false)
@@ -56,8 +68,12 @@ class ForegroundHealthSyncEngine(
                 .put("message", "App-start sync already requested in this process")
                 .put("synced_at", Instant.now().toString())
         }
+        activeRequestId = requestId
         logger.info(requestId, COMPONENT, "sync_queued", JSONObject().put("reason", normalizedReason))
-        scope.launch { syncNowForeground(normalizedReason, requestId) }
+        scope.launch {
+            try { syncNowForeground(normalizedReason, requestId) }
+            finally { syncRequested.set(false) }
+        }
         return JSONObject()
             .put("queued", true)
             .put("request_id", requestId)
@@ -65,10 +81,11 @@ class ForegroundHealthSyncEngine(
     }
 
     fun onAppForeground(reason: String = "app_resume") {
+        val wasForeground = foreground
         foreground = true
         logger.info("lifecycle", COMPONENT, "app_foreground", JSONObject().put("reason", reason))
         startForegroundLoop()
-        requestForegroundSync(reason)
+        if (!wasForeground) requestForegroundSync(reason)
     }
 
     fun onAppBackground() {
@@ -82,6 +99,8 @@ class ForegroundHealthSyncEngine(
         onAppBackground()
         scope.coroutineContext.cancelChildren()
         appStartRequested.set(false)
+        syncRequested.set(false)
+        activeRequestId = null
     }
 
     fun dispose() {
@@ -99,7 +118,7 @@ class ForegroundHealthSyncEngine(
                 logger.info("foreground_loop", COMPONENT, "loop_waiting", JSONObject().put("delay_ms", delayMs))
                 delay(delayMs)
                 if (!foreground) break
-                if (mutex.isLocked) {
+                if (mutex.isLocked || syncRequested.get()) {
                     val payload = JSONObject()
                         .put("type", "skipped_already_running")
                         .put("reason", "foreground_loop")
@@ -118,6 +137,8 @@ class ForegroundHealthSyncEngine(
         reason: String,
         requestId: String = UUID.randomUUID().toString(),
     ): JSONObject = mutex.withLock {
+        activeRequestId = requestId
+        try {
         val sessionGeneration = NativeAuthSession.sessionGeneration()
         emit(JSONObject()
             .put("type", "started")
@@ -157,6 +178,9 @@ class ForegroundHealthSyncEngine(
         }
         emit(result)
         result
+        } finally {
+            activeRequestId = null
+        }
     }
 
     private fun setLastSuccessfulSyncAt(value: Instant) {
@@ -166,10 +190,7 @@ class ForegroundHealthSyncEngine(
             .apply()
     }
 
-    private fun nextForegroundLoopDelayMs(): Long = Random.nextLong(
-        FOREGROUND_LOOP_INTERVAL_MIN_MS,
-        FOREGROUND_LOOP_INTERVAL_MAX_MS + 1,
-    )
+    private fun nextForegroundLoopDelayMs(): Long = FOREGROUND_LOOP_INTERVAL_MS
 
     private fun emit(payload: JSONObject) = emitSyncEvent(payload.toString())
 
@@ -179,7 +200,6 @@ class ForegroundHealthSyncEngine(
         private const val PREFS = "grafit_native_health_sync"
         private const val KEY_LAST_SUCCESS = "last_successful_foreground_sync_at"
         private const val SYNC_TIMEOUT_MS = 90_000L
-        private const val FOREGROUND_LOOP_INTERVAL_MIN_MS = 90_000L
-        private const val FOREGROUND_LOOP_INTERVAL_MAX_MS = 180_000L
+        private const val FOREGROUND_LOOP_INTERVAL_MS = 120_000L
     }
 }

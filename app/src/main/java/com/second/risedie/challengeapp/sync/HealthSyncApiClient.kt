@@ -25,6 +25,7 @@ class HealthSyncApiClient(
     private val credentials = SecureCredentialStore(context.applicationContext)
     private val auth = NativeAuthSession(context.applicationContext)
     private val playIntegrity = PlayIntegrityTokenProvider(context.applicationContext)
+    private val cadence = HealthSyncCadence(context.applicationContext)
     @Volatile private var lastHttpCode: Int? = null
     @Volatile private var sourceSyncHttpCode: Int? = null
 
@@ -146,10 +147,20 @@ class HealthSyncApiClient(
                     val processingStatus = fetchSyncStatus(config, batchId, sessionId)
                     when (processingStatus) {
                         "processed", "detail_pending" -> {
+                            if (body.optString("kind") == "health_connect_aggregate") {
+                                cadence.updateReceiptStatus(config.sourceId, item.optString("server_day"),
+                                    body.optJSONArray("records") ?: JSONArray(), processingStatus)
+                                logger.info(sessionId, COMPONENT, "aggregate_processing_confirmed", JSONObject()
+                                    .put("batch_id", batchId).put("processing_status", processingStatus))
+                            }
                             items.remove(item)
                             writeOutbox(config, items)
                         }
                         "rejected", "failed" -> {
+                            if (body.optString("kind") == "health_connect_aggregate") {
+                                cadence.updateReceiptStatus(config.sourceId, item.optString("server_day"),
+                                    body.optJSONArray("records") ?: JSONArray(), processingStatus)
+                            }
                             logger.warn(sessionId, COMPONENT, "outbox_processing_rejected", JSONObject()
                                 .put("batch_id", batchId).put("processing_status", processingStatus))
                             items.remove(item)
