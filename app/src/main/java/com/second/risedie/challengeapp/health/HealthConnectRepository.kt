@@ -37,6 +37,9 @@ data class ServerSyncWindow(
     val healthConnectWindowToken: String? = null,
 )
 
+class HealthDetailReadException(val reasonCode: String, cause: Throwable? = null) :
+    IllegalStateException(reasonCode, cause)
+
 class HealthConnectRepository(
     private val context: Context,
     private val syncLogger: HealthSyncLogger? = null,
@@ -404,13 +407,13 @@ class HealthConnectRepository(
     ): JSONObject = withContext(Dispatchers.IO) {
         traceSessionId?.let { syncLogger?.info(it, TRACE_COMPONENT, "detail_read_started", JSONObject().put("requests_count", requests.length())) }
         val client = clientOrNull()
-            ?: return@withContext emptyPayload("Health Connect недоступен.")
+            ?: throw HealthDetailReadException("detail_provider_unavailable")
         // Forensic verification of STEPS requires the STEPS permission, not
         // unrelated exercise/distance permissions. Missing metrics are never
         // interpreted as zero evidence.
         val granted = grantedPermissions()
         if (granted.intersect(dataPermissions).isEmpty()) {
-            return@withContext emptyPayload("Разрешения Health Connect не выданы.")
+            throw HealthDetailReadException("detail_health_permissions_missing")
         }
 
         val generatedAt = Instant.now()
@@ -429,14 +432,32 @@ class HealthConnectRepository(
             if (required.isEmpty() || !granted.containsAll(required)) {
                 traceSessionId?.let { syncLogger?.warn(it, TRACE_COMPONENT, "detail_permissions_missing",
                     JSONObject().put("detail_request_id", request.optLong("id", 0L)).put("metric", metric)) }
-                continue
+                throw HealthDetailReadException("detail_permission_missing_$metric")
             }
-            val from = parseInstantOrNull(request.optString("requested_window_from")) ?: continue
-            val to = parseInstantOrNull(request.optString("requested_window_to")) ?: continue
-            if (!to.isAfter(from)) continue
+            val from = parseInstantOrNull(request.optString("requested_window_from"))
+                ?: parseInstantOrNull(request.optString("detail_from"))
+                ?: throw HealthDetailReadException("detail_invalid_from")
+            val to = parseInstantOrNull(request.optString("requested_window_to"))
+                ?: parseInstantOrNull(request.optString("detail_to"))
+                ?: throw HealthDetailReadException("detail_invalid_to")
+            if (!to.isAfter(from)) throw HealthDetailReadException("detail_invalid_interval")
+            if (to.isAfter(generatedAt)) throw HealthDetailReadException("detail_interval_in_future")
 
-            val bucketMinutes = max(1L, request.optLong("preferred_bucket_minutes", 1L))
-            val buckets = detailBucketValues(client, metric, from, to, bucketMinutes)
+            val bucketMinutes = request.optLong("preferred_bucket_minutes", 1L).coerceIn(1L, 60L)
+            val buckets = try {
+                detailBucketValues(client, metric, from, to, bucketMinutes)
+            } catch (error: SecurityException) {
+                val historyGranted = granted.contains(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
+                traceSessionId?.let { syncLogger?.warn(it, TRACE_COMPONENT, "detail_read_denied",
+                    JSONObject().put("detail_request_id", request.optLong("id", 0L))
+                        .put("from", from.toString()).put("to", to.toString())
+                        .put("history_permission_granted", historyGranted)) }
+                // A denial can also be due to background access. Do not claim
+                // that the requested interval contained no steps.
+                throw HealthDetailReadException(
+                    if (!historyGranted && from.isBefore(generatedAt.minus(Duration.ofDays(30))))
+                        "detail_history_permission_missing" else "detail_read_permission_denied", error)
+            }
             traceSessionId?.let { sessionId ->
                 syncLogger?.info(sessionId, TRACE_COMPONENT, "detail_request_read", JSONObject()
                     .put("detail_request_id", request.optLong("id", 0L))
@@ -1283,70 +1304,40 @@ class HealthConnectRepository(
 
         when (metric) {
             "steps", "walk_steps" -> {
-                val records = try {
-                    val all = mutableListOf<StepsRecord>()
-                    var token: String? = null
-                    val seenTokens = mutableSetOf<String>()
-                    var pages = 0
-                    do {
-                        // A long verification interval can exceed one Health Connect page.
-                        // Partial pages must NEVER count as successfully checked evidence.
-                        val response = client.readRecords(
-                            ReadRecordsRequest(
-                                recordType = StepsRecord::class,
-                                timeRangeFilter = TimeRangeFilter.between(from, to),
-                                pageToken = token,
-                            )
+                // Use native interval aggregates: Health Connect deduplicates origins.
+                // Never invent minute readings by spreading a multi-hour record.
+                val groups = try {
+                    client.aggregateGroupByDuration(
+                        AggregateGroupByDurationRequest(
+                            metrics = setOf(StepsRecord.COUNT_TOTAL),
+                            timeRangeFilter = TimeRangeFilter.between(from, to),
+                            timeRangeSlicer = Duration.ofMinutes(bucketMinutes),
                         )
-                        all.addAll(response.records)
-                        token = response.pageToken?.takeIf { it.isNotBlank() }
-                        if (token != null) check(seenTokens.add(token)) { "Health Connect detail pagination token repeated" }
-                        pages++
-                        check(pages < 200 || token == null) { "Health Connect detail pagination limit reached" }
-                    } while (token != null)
-                    all
+                    )
                 } catch (error: CancellationException) {
+                    throw error
+                } catch (error: SecurityException) {
                     throw error
                 } catch (error: Exception) {
                     if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
-                    // Prefer a second independent Health Connect *minute-bucketed*
-                    // read over declaring the entire request empty. Never reuse the
-                    // original unverified daily aggregate as evidence.
-                    warnings.add("read_records_detail_unavailable")
-                    emptyList()
+                    throw HealthDetailReadException("detail_native_interval_aggregate_failed", error)
                 }
-
-                if (records.isNotEmpty()) {
-                    for (bucket in buckets) {
-                        bucket.value = stepsForBucketByBestOrigin(records, bucket)
-                    }
-                } else {
-                    // Some Health Connect providers expose an aggregate but no
-                    // individually readable StepsRecord. This API returns native
-                    // bucketed measurements, which still pass server plausibility
-                    // and original-request boundary validation.
-                    val groups = try {
-                        client.aggregateGroupByDuration(
-                            AggregateGroupByDurationRequest(
-                                metrics = setOf(StepsRecord.COUNT_TOTAL),
-                                timeRangeFilter = TimeRangeFilter.between(from, to),
-                                timeRangeSlicer = Duration.ofMinutes(bucketMinutes.coerceAtLeast(1L)),
-                            )
-                        )
-                    } catch (error: CancellationException) {
-                        throw error
-                    } catch (error: Exception) {
-                        if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
-                        throw IllegalStateException("Health Connect detailed steps records and bucketed aggregate unavailable", error)
-                    }
-                    for (group in groups) {
-                        val total = group.result[StepsRecord.COUNT_TOTAL] ?: 0L
-                        if (total > 0L) {
-                            distributeValue(group.startTime, group.endTime, total.toDouble(), buckets)
-                        }
-                    }
-                    warnings.add("detail_native_duration_aggregation_used")
+                if (groups.none { it.result[StepsRecord.COUNT_TOTAL] != null }) {
+                    throw HealthDetailReadException("detail_no_native_steps_in_requested_interval")
                 }
+                val byStart = buckets.associateBy { it.from }
+                val seen = mutableSetOf<Instant>()
+                for (group in groups) {
+                    val total = group.result[StepsRecord.COUNT_TOTAL] ?: continue
+                    val bucket = byStart[group.startTime]
+                        ?: throw HealthDetailReadException("detail_native_bucket_outside_request")
+                    if (group.endTime != bucket.to || !seen.add(group.startTime) || total < 0L) {
+                        throw HealthDetailReadException("detail_native_bucket_boundary_mismatch")
+                    }
+                    bucket.value = total.toDouble()
+                }
+                // A successful native range query omits empty buckets. Explicit
+                // zeros only fill those gaps; a wholly unavailable read throws.
             }
 
             "meters", "run_distance", "run_meters" -> {

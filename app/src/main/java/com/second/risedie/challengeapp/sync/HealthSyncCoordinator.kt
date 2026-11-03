@@ -3,6 +3,7 @@ package com.second.risedie.challengeapp.sync
 import android.content.Context
 import android.os.RemoteException
 import androidx.health.connect.client.HealthConnectClient
+import com.second.risedie.challengeapp.health.HealthDetailReadException
 import com.second.risedie.challengeapp.health.HealthConnectRepository
 import com.second.risedie.challengeapp.health.ServerSyncWindow
 import kotlinx.coroutines.CancellationException
@@ -531,7 +532,8 @@ class HealthSyncCoordinator(context: Context) {
                 if (HealthConnectQuotaGuard.isQuotaExceeded(error)) throw error
                 failed++
                 retryableFailure = retryableFailure || isTransientFailure(error)
-                lastError = error.javaClass.simpleName.replace(Regex("[^a-zA-Z0-9_.:-]"), "_").take(120)
+                lastError = ((error as? HealthDetailReadException)?.reasonCode ?: error.javaClass.simpleName)
+                    .replace(Regex("[^a-zA-Z0-9_.:-]"), "_").take(120)
                 apiClient.reportDetailProgress(config, requestId,
                     if (phase == "reading") "read_failed" else "upload_failed", lastError, sessionId)
                 logger.warn(sessionId, "detail_requests", "request_failed_will_retry", JSONObject()
