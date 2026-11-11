@@ -22,7 +22,7 @@ class NativeAuthSession(context: Context) {
             val input = runCatching { JSONObject(payloadJson.orEmpty()) }.getOrNull()
                 ?: return@synchronized result(false, "invalid_payload")
             // A capability with a fixed endpoint and a narrow payload, never a raw-token setter.
-            val fields = setOf("login", "password", "nickname", "email", "personal_data_consent", "terms_accepted",
+            val fields = setOf("login", "password", "mfa_code", "nickname", "email", "personal_data_consent", "terms_accepted",
                 "legal_version", "install_uuid", "device_name", "device_model", "platform", "app_version", "os_version", "push_token")
             val body = JSONObject()
             fields.forEach { if (input.has(it)) body.put(it, input.get(it)) }

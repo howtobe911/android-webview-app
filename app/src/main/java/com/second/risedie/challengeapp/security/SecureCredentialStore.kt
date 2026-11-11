@@ -22,12 +22,15 @@ class SecureCredentialStore(context: Context) {
 
     @Synchronized
     fun writeSessionTokens(accessToken: String, refreshToken: String) {
+        synchronized(CREDENTIAL_LOCK) {
         require(accessToken.isNotBlank() && refreshToken.isNotBlank())
         // One encrypted envelope commits both rotated tokens atomically.
         persistEncrypted(org.json.JSONObject().put("access", accessToken).put("refresh", refreshToken).toString(), KEY_SESSION, KEY_SESSION_IV)
         check(readAccessToken() == accessToken && readRefreshToken() == refreshToken) { "Secure session readback failed" }
         prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).commit()
         clearLegacyTokens()
+
+        }
     }
 
     private fun sessionToken(field: String): String? = decryptStored(KEY_SESSION, KEY_SESSION_IV)?.let {
@@ -53,6 +56,7 @@ class SecureCredentialStore(context: Context) {
 
     @Synchronized
     fun writeAccessToken(token: String) {
+        synchronized(CREDENTIAL_LOCK) {
         require(token.isNotBlank()) { "Access token must not be blank" }
         if (sessionToken("refresh") != null) {
             writeSessionTokens(token, requireNotNull(sessionToken("refresh")))
@@ -61,10 +65,13 @@ class SecureCredentialStore(context: Context) {
         persistEncrypted(token, KEY_CIPHERTEXT, KEY_IV)
         check(decryptStored(KEY_CIPHERTEXT, KEY_IV) == token) { "Secure access-token readback failed" }
         clearLegacyTokens()
+
+        }
     }
 
     @Synchronized
     fun readAccessToken(): String? {
+        synchronized(CREDENTIAL_LOCK) {
         sessionToken("access")?.let { return it }
         decryptStored(KEY_CIPHERTEXT, KEY_IV)?.takeIf { it.isNotBlank() }?.let { return it }
         val legacy = readLegacyToken() ?: return null
@@ -75,16 +82,22 @@ class SecureCredentialStore(context: Context) {
         }
         clearLegacyTokens()
         return legacy
+
+        }
     }
 
     @Synchronized
     fun clearAccessToken() {
+        synchronized(CREDENTIAL_LOCK) {
         prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).remove(KEY_SESSION).remove(KEY_SESSION_IV).commit()
         clearLegacyTokens()
+
+        }
     }
 
     @Synchronized
     fun writeRefreshToken(token: String) {
+        synchronized(CREDENTIAL_LOCK) {
         require(token.isNotBlank()) { "Refresh token must not be blank" }
         if (sessionToken("access") != null) {
             writeSessionTokens(requireNotNull(sessionToken("access")), token)
@@ -92,19 +105,26 @@ class SecureCredentialStore(context: Context) {
         }
         persistEncrypted(token, KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)
         check(decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV) == token) { "Secure refresh-token readback failed" }
+
+        }
     }
 
     @Synchronized
-    fun readRefreshToken(): String? =
+    fun readRefreshToken(): String? = synchronized(CREDENTIAL_LOCK) {
         sessionToken("refresh") ?: decryptStored(KEY_REFRESH_CIPHERTEXT, KEY_REFRESH_IV)?.takeIf { it.isNotBlank() }
+    }
 
     @Synchronized
     fun clearRefreshToken() {
+        synchronized(CREDENTIAL_LOCK) {
         prefs.edit().remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV).remove(KEY_SESSION).remove(KEY_SESSION_IV).commit()
+
+        }
     }
 
     @Synchronized
     fun clearSessionTokens() {
+        synchronized(CREDENTIAL_LOCK) {
         prefs.edit()
             .remove(KEY_CIPHERTEXT).remove(KEY_IV)
             .remove(KEY_REFRESH_CIPHERTEXT).remove(KEY_REFRESH_IV)
@@ -112,6 +132,8 @@ class SecureCredentialStore(context: Context) {
             .remove(KEY_DAY_CLOSE_ACK).remove(KEY_DAY_CLOSE_ACK_IV)
             .commit()
         clearLegacyTokens()
+
+        }
     }
 
     private fun persistEncrypted(token: String, ciphertextKey: String, ivKey: String) {
@@ -176,6 +198,9 @@ class SecureCredentialStore(context: Context) {
     }
 
     companion object {
+        // Shared by ALL store instances. Per-instance @Synchronized was insufficient
+        // when an Activity, background Worker and push service rotated concurrently.
+        private val CREDENTIAL_LOCK = Any()
         private const val PREFS = "grafit_secure_credentials"
         private const val KEY_SESSION = "session_ciphertext_v2"
         private const val KEY_SESSION_IV = "session_iv_v2"
