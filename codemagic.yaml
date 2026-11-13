@@ -53,3 +53,32 @@ workflows:
             app:assembleRelease
     artifacts:
       - app/build/outputs/apk/release/*.apk
+  grafit_ios_verify:
+    name: GraFit iOS Verify
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    scripts:
+      - name: Verify iOS build and core tests
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/ios-webview-app"
+          bash verify-on-mac.sh
+
+      - name: Build unsigned iPhone app
+        script: |
+          set -e
+          cd "$CM_BUILD_DIR/ios-webview-app"
+          xcodebuild \
+            -project GraFitWebView.xcodeproj \
+            -scheme GraFitWebView \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$CM_BUILD_DIR/ios-build" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+    artifacts:
+      - ios-build/Build/Products/Release-iphoneos/*.app
+      - /tmp/xcodebuild_logs/*.log
